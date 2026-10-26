@@ -49,10 +49,12 @@ mod libc;
 mod mach_o;
 mod matrix;
 mod mem;
+mod log_share;
 mod objc;
 mod options;
 mod paths;
 mod perf_hints;
+mod stall_watchdog;
 mod stack;
 mod guest_clock;
 mod trainer;
@@ -630,6 +632,12 @@ fn run_session<T: Iterator<Item = String>>(
             std::panic::resume_unwind(e)
         }
     };
+    // Watch for a guest thread that stops making progress. A hang leaves no
+    // crash report and no log line of its own, so this is the only way the log
+    // can say where the app stopped, and the only way to offer the user a
+    // "share the log" button while the emulator is stuck. See
+    // [stall_watchdog].
+    stall_watchdog::start(options.popup_errors && !options.headless);
     let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| env.run()));
     match run_result {
         Ok(termination) => Ok(termination),

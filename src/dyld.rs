@@ -898,6 +898,13 @@ impl Dyld {
                 continue;
             }
 
+            // Remember which imported function this stub stands for, so that a
+            // stall report ("the emulator stopped here") can name it instead of
+            // printing a bare address. See `crate::stall_watchdog`.
+            if let Some(Some(name)) = indirect_info.indirect_undef_symbols.get(i as usize) {
+                crate::stall_watchdog::register_import_stub(stubs.addr + i * entry_size, name);
+            }
+
             // For convenience, make the stub return once the SVC is done
             // (Otherwise we have to manually update the PC)
             if entry_size == 4 {

@@ -8,21 +8,56 @@
 use std::fs::File;
 use std::sync::{LazyLock, Mutex};
 
+/// Path of the log file for the current run.
+pub fn log_file_path() -> std::path::PathBuf {
+    crate::paths::user_data_base_path().join(crate::paths::LOG_FILE)
+}
+
+/// Path of the log file for the previous run (see [crate::paths::PREVIOUS_LOG_FILE]).
+pub fn previous_log_file_path() -> std::path::PathBuf {
+    crate::paths::user_data_base_path().join(crate::paths::PREVIOUS_LOG_FILE)
+}
+
 /// Get a handle to the log file. This is only for use by logging macros!
 ///
 /// All the logging macros print to stderr or (on Android) logcat, but this
 /// is not convenient for users who aren't accustomed to command-line tools or
 /// who don't have access to ADB, so we also write to a log file.
+///
+/// The previous run's log is kept as [previous_log_file_path] rather than
+/// being deleted, because the interesting failures are often hangs (a game
+/// that stops drawing) rather than crashes: the user has to restart the
+/// emulator to get back to the app picker, and that restart would otherwise
+/// truncate the only evidence of what the game was doing when it stopped.
 pub fn get_log_file() -> &'static Mutex<File> {
     static LOG_FILE: LazyLock<Mutex<File>> = LazyLock::new(|| {
-        let file =
-            File::create(crate::paths::user_data_base_path().join("touchHLE_log.txt")).unwrap();
+        let path = log_file_path();
+        let previous = previous_log_file_path();
+        if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > 0) {
+            // Best-effort: a failure here must not stop the emulator from
+            // logging, it only means the old run's log is lost as before.
+            let _ = std::fs::rename(&path, &previous);
+        }
+        let file = File::create(&path).unwrap();
         #[cfg(unix)]
         crate::crash_handler::set_log_fd(std::os::fd::AsRawFd::as_raw_fd(&file));
         Mutex::new(file)
     });
 
     &LOG_FILE
+}
+
+/// Make sure everything written so far has reached the log file.
+///
+/// Anything that hands the file to another program (sharing it, opening it in
+/// a viewer) must call this first, otherwise the last lines — exactly the ones
+/// that matter after a hang — may still be sitting in the process's buffer.
+pub fn flush_log() {
+    if let Ok(mut file) = get_log_file().lock() {
+        let _ = std::io::Write::flush(&mut *file);
+        // Logcat/stderr are unbuffered, so only the file needs this.
+        let _ = file.sync_data();
+    }
 }
 
 /// Prints a log message unconditionally. Use this for errors or warnings.

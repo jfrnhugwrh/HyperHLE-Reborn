@@ -183,6 +183,12 @@ struct TranslatorState {
     logic_op_enabled: bool,
     logic_op: GLenum,
     gles3: bool,
+    /// Lazily-detected host `GL_EXT_discard_framebuffer` support
+    /// (`None` until the first guest discard call). The host here is a
+    /// real ES 2.0 driver (often ANGLE on Android), which usually
+    /// exports the extension even though the guest sees an ES 1.1
+    /// context.
+    discard_ext: Option<bool>,
 }
 
 impl TranslatorState {
@@ -263,6 +269,7 @@ impl TranslatorState {
             logic_op_enabled: false,
             logic_op: es1::COPY,
             gles3: false,
+            discard_ext: None,
         }
     }
 
@@ -996,6 +1003,48 @@ impl GLES for GLES1OnGLES2<'_> {
         true
     }
     fn is_translator(&self) -> bool {
+        true
+    }
+
+    fn discard_ext_supported(&self) -> bool {
+        self.state.discard_ext.unwrap_or(false)
+    }
+
+    unsafe fn DiscardFramebufferEXT(
+        &mut self,
+        target: GLenum,
+        num_attachments: GLsizei,
+        attachments: *const GLenum,
+    ) -> bool {
+        // The guest sees an ES 1.1 context but the host is ES 2.0, whose
+        // drivers (ANGLE included) usually export the same extension
+        // with the same attachment values — forward when present.
+        // Detect once, lazily: make_current order means the extension
+        // string is only guaranteed readable once a call arrives.
+        // Never call the binding when unsupported (see GLES2Native).
+        if num_attachments <= 0 || attachments.is_null() || target != 0x8D40 {
+            return false;
+        }
+        let supported = match self.state.discard_ext {
+            Some(supported) => supported,
+            None => {
+                let raw = gl::GetString(gl::EXTENSIONS);
+                let supported = !raw.is_null()
+                    && CStr::from_ptr(raw as *const _)
+                        .to_str()
+                        .map(|exts| {
+                            exts.split_whitespace()
+                                .any(|ext| ext == "GL_EXT_discard_framebuffer")
+                        })
+                        .unwrap_or(false);
+                self.state.discard_ext = Some(supported);
+                supported
+            }
+        };
+        if !supported {
+            return false;
+        }
+        gl::DiscardFramebufferEXT(target, num_attachments, attachments);
         true
     }
 

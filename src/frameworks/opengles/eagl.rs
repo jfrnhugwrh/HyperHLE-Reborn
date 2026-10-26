@@ -1128,7 +1128,35 @@ pub const CLASSES: ClassExports = objc_classes! {
         log_once!("Using the iOS ES2 direct presenter for a non-fullscreen CAEAGLLayer.");
     }
 
-    if drawable == fullscreen_layer || fullscreen_layer != nil || use_ios_es2_direct_path {
+    // `--present-mode=direct` is an explicit user/per-app request for the
+    // GPU presenter, but it used to be honoured only *inside* the
+    // fullscreen branch below: when find_fullscreen_eagl_layer() found
+    // no layer (a rejected frame/opacity/transform check, see
+    // FULLSCREEN-DIAG), the mode was silently ignored and every frame
+    // still took the RAM-readback slow path further down — a full
+    // pipeline stall per frame on tile-based Android GPUs, which can
+    // leave a game looking frozen on its splash screen even though it
+    // is rendering (e.g. Ghost Toasters on ANGLE ES 2.0). Honour the
+    // explicit request for shader-based backends, whose direct
+    // presenter restores guest state exactly. The ES 1.1 translator is
+    // excluded: it cannot run the GPU presenters (see below), so it
+    // keeps readback regardless.
+    let use_direct_present_fallback = env.options.present_mode == PresentMode::Direct
+        && fullscreen_layer == nil
+        && backend_is_es2
+        && !backend_is_translator;
+    if use_direct_present_fallback {
+        log_once!(
+            "Using the ES2 direct presenter for a non-fullscreen CAEAGLLayer \
+             because --present-mode=direct was requested (no RAM readback)."
+        );
+    }
+
+    if drawable == fullscreen_layer
+        || fullscreen_layer != nil
+        || use_ios_es2_direct_path
+        || use_direct_present_fallback
+    {
         // Decide between presenting on the GPU (copy the renderbuffer into a
         // texture and draw it into the window — cheap) and reading the frame
         // back to RAM and pushing it through the compositor (a full pipeline

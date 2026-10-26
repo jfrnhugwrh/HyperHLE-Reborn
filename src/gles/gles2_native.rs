@@ -42,6 +42,10 @@ pub struct GLES2NativeContext {
     shadow_samplers_ext_supported: bool,
     /// Whether the host driver advertises `GL_OES_texture_3D`.
     texture_3d_ext_supported: bool,
+    /// Whether the host ES 2.0 driver exports `glDiscardFramebufferEXT`
+    /// (`GL_EXT_discard_framebuffer`). ANGLE and most Adreno/Mali ES 2.0
+    /// drivers do; checked with `pvrtc_native` in `make_current`.
+    discard_ext: bool,
 }
 
 impl GLESContext for GLES2NativeContext {
@@ -58,6 +62,7 @@ impl GLESContext for GLES2NativeContext {
             texture_lod_ext_supported: false,
             shadow_samplers_ext_supported: false,
             texture_3d_ext_supported: false,
+            discard_ext: false,
         })
     }
 
@@ -72,6 +77,7 @@ impl GLESContext for GLES2NativeContext {
                 texture_lod_ext_supported: self.texture_lod_ext_supported,
                 shadow_samplers_ext_supported: self.shadow_samplers_ext_supported,
                 texture_3d_ext_supported: self.texture_3d_ext_supported,
+                discard_ext: self.discard_ext,
                 map_buffer_stagings: Vec::new(),
             });
         }
@@ -89,6 +95,7 @@ impl GLESContext for GLES2NativeContext {
             self.texture_lod_ext_supported = unsafe { detect_texture_lod_ext_support() };
             self.shadow_samplers_ext_supported = unsafe { detect_shadow_samplers_ext_support() };
             self.texture_3d_ext_supported = unsafe { detect_texture_3d_ext_support() };
+            self.discard_ext = unsafe { detect_discard_ext_support() };
             self.pvrtc_native_checked = true;
         }
         Box::new(GLES2Native {
@@ -97,6 +104,7 @@ impl GLESContext for GLES2NativeContext {
             texture_lod_ext_supported: self.texture_lod_ext_supported,
             shadow_samplers_ext_supported: self.shadow_samplers_ext_supported,
             texture_3d_ext_supported: self.texture_3d_ext_supported,
+            discard_ext: self.discard_ext,
             map_buffer_stagings: Vec::new(),
         })
     }
@@ -113,6 +121,7 @@ impl GLESContext for GLES2NativeContext {
                 texture_lod_ext_supported: self.texture_lod_ext_supported,
                 shadow_samplers_ext_supported: self.shadow_samplers_ext_supported,
                 texture_3d_ext_supported: self.texture_3d_ext_supported,
+                discard_ext: self.discard_ext,
                 map_buffer_stagings: Vec::new(),
             });
         }
@@ -125,6 +134,7 @@ impl GLESContext for GLES2NativeContext {
             self.texture_lod_ext_supported = detect_texture_lod_ext_support();
             self.shadow_samplers_ext_supported = detect_shadow_samplers_ext_support();
             self.texture_3d_ext_supported = detect_texture_3d_ext_support();
+            self.discard_ext = detect_discard_ext_support();
             self.pvrtc_native_checked = true;
         }
         Box::new(GLES2Native {
@@ -133,6 +143,7 @@ impl GLESContext for GLES2NativeContext {
             texture_lod_ext_supported: self.texture_lod_ext_supported,
             shadow_samplers_ext_supported: self.shadow_samplers_ext_supported,
             texture_3d_ext_supported: self.texture_3d_ext_supported,
+            discard_ext: self.discard_ext,
             map_buffer_stagings: Vec::new(),
         })
     }
@@ -212,6 +223,29 @@ unsafe fn detect_texture_3d_ext_support() -> bool {
     extensions
         .split_whitespace()
         .any(|extension| extension == "GL_OES_texture_3D")
+}
+
+/// Query `GL_EXTENSIONS` and return whether the host ES 2.0 driver
+/// exports `glDiscardFramebufferEXT` (`GL_EXT_discard_framebuffer`).
+/// Must be called with a current GL context. ANGLE — the ES 2.0 host
+/// on Android — advertises it, as do Adreno/Mali ES 2.0 drivers.
+///
+/// The generated binding must never be called when this returns
+/// `false`: `gl_generator` installs a panicking stub for entry points
+/// the loader could not resolve, so an unguarded forward on a driver
+/// without the extension would abort the emulator instead of merely
+/// ignoring a hint.
+unsafe fn detect_discard_ext_support() -> bool {
+    let legacy = gles2::GetString(gles11::EXTENSIONS);
+    if legacy.is_null() {
+        return false;
+    }
+    let Ok(extensions) = CStr::from_ptr(legacy as *const _).to_str() else {
+        return false;
+    };
+    extensions
+        .split_whitespace()
+        .any(|extension| extension == "GL_EXT_discard_framebuffer")
 }
 
 /// Returns `true` if the shader source contains a top-level default float
@@ -506,6 +540,8 @@ pub struct GLES2Native<'gl_ctx> {
     texture_lod_ext_supported: bool,
     shadow_samplers_ext_supported: bool,
     texture_3d_ext_supported: bool,
+    /// Mirror of [`GLES2NativeContext::discard_ext`].
+    discard_ext: bool,
     /// CPU staging buffers for the `glMapBufferOES` fallback (see below).
     ///
     /// Games can legitimately have more than one buffer mapped at a time
@@ -566,6 +602,34 @@ fn is_es1_only_hint_target(target: GLenum) -> bool {
 #[allow(clippy::missing_safety_doc)]
 impl GLES for GLES2Native<'_> {
     fn is_es2(&self) -> bool {
+        true
+    }
+
+    fn discard_ext_supported(&self) -> bool {
+        self.discard_ext
+    }
+
+    unsafe fn DiscardFramebufferEXT(
+        &mut self,
+        target: GLenum,
+        num_attachments: GLsizei,
+        attachments: *const GLenum,
+    ) -> bool {
+        // Only GL_FRAMEBUFFER is a legal target for the EXT entry point;
+        // anything else (e.g. GL_READ_FRAMEBUFFER) would earn a sticky
+        // GL_INVALID_ENUM from ANGLE. The guest layer has already
+        // canonicalized the attachment list, so forward it unchanged —
+        // GL_COLOR_EXT/GL_DEPTH_EXT/GL_STENCIL_EXT share their values
+        // with the host extension. Without host support the hint is
+        // simply consumed (return false, no host call, no error).
+        if !self.discard_ext
+            || target != 0x8D40 // GL_FRAMEBUFFER
+            || num_attachments <= 0
+            || attachments.is_null()
+        {
+            return false;
+        }
+        gles2::DiscardFramebufferEXT(target, num_attachments, attachments);
         true
     }
 

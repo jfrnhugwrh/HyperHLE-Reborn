@@ -1,0 +1,62 @@
+name: Clean up workflow run history
+
+on:
+  schedule:
+    # Run every three hours, UTC. GitHub schedules are attached to the default branch.
+    - cron: '0 */3 * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: workflow-run-cleanup-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  delete-completed-runs:
+    name: Delete prior completed workflow runs
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Delete completed runs across the repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Workflow definitions are source files and are never removed here.
+          # Only completed run records (including their logs/artifacts) are
+          # deleted; queued and in-progress jobs are deliberately left alone.
+          endpoint="repos/${GITHUB_REPOSITORY}/actions/runs?per_page=100"
+          run_ids="$(mktemp)"
+          trap 'rm -f "$run_ids"' EXIT
+
+          # Fetch every page before deleting anything, so removals cannot shift
+          # page boundaries and cause older runs to be skipped.
+          gh api --paginate --jq '.workflow_runs[] | select(.status == "completed") | .id' \
+            "$endpoint" > "$run_ids"
+
+          deleted=0
+          failed=0
+          while IFS= read -r run_id; do
+            [[ -n "$run_id" ]] || continue
+            [[ "$run_id" == "$CURRENT_RUN_ID" ]] && continue
+
+            if gh api --silent --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}"; then
+              echo "Deleted completed workflow run $run_id"
+              deleted=$((deleted + 1))
+            else
+              echo "::warning::Could not delete workflow run $run_id"
+              failed=$((failed + 1))
+            fi
+          done < "$run_ids"
+
+          echo "Deleted $deleted completed workflow run(s); $failed deletion(s) failed."
+          if (( failed > 0 )); then
+            exit 1
+          fi

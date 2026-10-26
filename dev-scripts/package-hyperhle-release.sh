@@ -1,5 +1,6 @@
 #!/bin/sh
-# Package HyperHLE release zips and write release notes for action-gh-release.
+# Package the HyperHLE Android release zip and write release notes for
+# action-gh-release. This fork only ships Android builds.
 set -eu
 
 VERSION="$1"
@@ -13,41 +14,7 @@ fi
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-windows_exe=""
-for candidate in \
-    artifacts/windows/touchHLE.exe \
-    artifacts/windows/touchHLE_windows_bundle/touchHLE.exe
-do
-    if [ -e "$candidate" ]; then
-        windows_exe="$candidate"
-        break
-    fi
-done
-
-linux_bin=""
-for candidate in \
-    artifacts/linux/touchHLE \
-    artifacts/linux/touchHLE_linux_bundle/touchHLE
-do
-    if [ -e "$candidate" ]; then
-        linux_bin="$candidate"
-        break
-    fi
-done
-
-macos_x86_dmg=""
-for candidate in \
-    artifacts/macos-x86_64/touchHLE_x86_64-apple-darwin.dmg \
-    artifacts/macos/HyperHLE.dmg \
-    artifacts/macos/touchHLE.dmg
-do
-    if [ -e "$candidate" ]; then
-        macos_x86_dmg="$candidate"
-        break
-    fi
-done
-macos_arm_dmg="artifacts/macos-aarch64/touchHLE_aarch64-apple-darwin.dmg"
-
+# This fork only ships Android builds; the APK is the only artifact.
 android_apk=""
 for candidate in \
     artifacts/android/HyperHLE-Reborn.apk \
@@ -59,32 +26,10 @@ do
     fi
 done
 
-for path in "$macos_x86_dmg" "$macos_arm_dmg" "$android_apk"; do
-    if [ -z "$path" ] || [ ! -e "$path" ]; then
-        echo "Missing build artifact (all platform builds must succeed): $path" >&2
-        exit 1
-    fi
-done
-if [ -z "$windows_exe" ]; then
-    echo "Missing build artifact (all platform builds must succeed): artifacts/windows/touchHLE.exe" >&2
+if [ -z "$android_apk" ] || [ ! -e "$android_apk" ]; then
+    echo "Missing build artifact (the Android build must succeed): $android_apk" >&2
     exit 1
 fi
-windows_installer="artifacts/windows-installer/HyperHLE_Windows_x86_64_Setup.exe"
-if [ ! -f "$windows_installer" ]; then
-    echo "Missing build artifact (all platform builds must succeed): $windows_installer" >&2
-    exit 1
-fi
-if [ -z "$linux_bin" ]; then
-    echo "Missing build artifact (all platform builds must succeed): artifacts/linux/touchHLE" >&2
-    exit 1
-fi
-ios_ipas="HyperHLE-iOS-unsigned.ipa HyperHLE-iOS-trollstore.ipa HyperHLE-iOS-trollstore-permanent-jit.ipa"
-for ipa in $ios_ipas; do
-    if [ ! -f "artifacts/ios/$ipa" ]; then
-        echo "Missing build artifact (all platform builds must succeed): artifacts/ios/$ipa" >&2
-        exit 1
-    fi
-done
 
 if [ -z "$CHANGELOG_FROM" ]; then
     # The newest release tag older than VERSION (versions roll over at 12, see
@@ -174,21 +119,5 @@ cd "$ROOT/dev-scripts"
 
 prefix="HyperHLE"
 
-./prepare-release.sh --create-zip-macos "$ROOT/$macos_x86_dmg" \
-    -o "$ROOT/release/${prefix}_macOS_x86_64.zip"
-./prepare-release.sh --create-zip-macos "$ROOT/$macos_arm_dmg" \
-    -o "$ROOT/release/${prefix}_macOS_AArch64.zip"
 ./prepare-release.sh --create-zip-android "$ROOT/$android_apk" \
     -o "$ROOT/release/${prefix}_Android_AArch64.zip"
-./prepare-release.sh --create-zip-windows \
-    "$ROOT/$windows_exe" \
-    -o "$ROOT/release/${prefix}_Windows_x86_64.zip"
-./prepare-release.sh --create-zip-linux \
-    "$ROOT/$linux_bin" \
-    -o "$ROOT/release/${prefix}_Linux_x86_64.zip"
-# The Windows installer is attached as it is (see build-win).
-cp "$ROOT/$windows_installer" "$ROOT/release/HyperHLE_Windows_x86_64_Setup.exe"
-# The iOS IPAs are attached as they are (see build-ios in HyperHLE_release.yml).
-for ipa in $ios_ipas; do
-    cp "$ROOT/artifacts/ios/$ipa" "$ROOT/release/$ipa"
-done

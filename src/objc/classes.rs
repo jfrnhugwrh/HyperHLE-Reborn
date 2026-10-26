@@ -32,6 +32,15 @@ use std::collections::{HashMap, VecDeque};
 /// get the same unidirectional type safety.
 pub type Class = id;
 
+/// Upper bound for superclass-chain walks.
+///
+/// A correct class hierarchy is acyclic, so any real walk terminates after a
+/// handful of steps. Guest code that rewrites classes at runtime
+/// (`class_setSuperclass`, ivar swizzling) can create a cycle, and a
+/// clobbered `class_t` can point a class at itself; Swift/ObjC runtimes trap
+/// on that, but an emulator must survive it, so every walk is bounded.
+const CLASS_HIERARCHY_WALK_LIMIT: usize = 1024;
+
 #[derive(Copy, Clone)]
 pub(super) struct IvarInfo {
     pub(super) offset: ConstPtr<GuestUSize>,
@@ -933,21 +942,25 @@ impl ObjC {
             let next = queue.pop_front().unwrap();
             let (need, mut diff) = self.need_ivar_reconciliation(next);
             if crate::env_flag_cached!("TOUCHHLE_TRACE_IVARS") {
-                let (class_name, superclass, instance_start, instance_size) = {
-                    let host = self.borrow::<ClassHostObject>(next);
+                // Strict accessor: a class in this graph always has a
+                // `ClassHostObject`, but its *superclass* does not have to (the
+                // template's superclass may have resolved to a placeholder), and
+                // the trace must not fake one into existence.
+                let trace_info = self.class_host_object(next).map(|host| {
                     (
                         host.name.clone(),
                         host.superclass,
                         host.instance_start,
                         host.instance_size,
                     )
-                };
+                });
+                let (class_name, superclass, instance_start, instance_size) = trace_info
+                    .unwrap_or_else(|| ("<unknown>".to_string(), nil, 0, 0));
                 if class_name.starts_with("CC") {
-                    let superclass_size = if superclass == nil {
-                        0
-                    } else {
-                        self.borrow::<ClassHostObject>(superclass).instance_size
-                    };
+                    let superclass_size = self
+                        .class_host_object(superclass)
+                        .map(|host| host.instance_size)
+                        .unwrap_or(0);
                     log!(
                         "IVAR-LAYOUT class={} start={} size={} superclass_size={} need={} diff={}",
                         class_name,
@@ -960,11 +973,18 @@ impl ObjC {
                 }
             }
             if need {
-                let (name, superclass) = {
-                    let host = self.borrow::<ClassHostObject>(next);
-                    (host.name.clone(), host.superclass)
+                // Strict accessor again: skip (rather than fabricate) a class
+                // whose host object is not a `ClassHostObject`.
+                let Some((name, superclass)) = self
+                    .class_host_object(next)
+                    .map(|host| (host.name.clone(), host.superclass))
+                else {
+                    continue;
                 };
-                let superclass_name = self.borrow::<ClassHostObject>(superclass).name.clone();
+                let superclass_name = self
+                    .try_get_class_name(superclass)
+                    .map(|name| name.to_owned())
+                    .unwrap_or_else(|| "<unknown>".to_string());
                 log_dbg!(
                     "Class {} need ivar reconciliation with superclass {}!",
                     name,
@@ -1177,11 +1197,13 @@ impl ObjC {
                 continue;
             }
             let category_protocols = protocol_list_entries(mem, category_protocol_list);
-            let is_class_host_object = self
-                .get_host_object(class)
-                .is_some_and(|host| host.as_any().is::<ClassHostObject>());
-            if is_class_host_object {
-                let class_host_object = self.borrow_mut::<ClassHostObject>(class);
+            // Attach the category's protocols through the strict accessor: a
+            // category on a class we only stubbed out upgrades the placeholder
+            // to a real class host object instead of writing into a phantom (see
+            // `ObjC::promote_placeholder_class`). `FakeClass` deliberately has
+            // no storage, because it stands in for a defunct SDK's code that we
+            // do not want to run at all.
+            if let Some(class_host_object) = self.class_host_object_mut(class) {
                 for protocol in category_protocols {
                     if !class_host_object.protocols.contains(&protocol) {
                         class_host_object.protocols.push(protocol);
@@ -1189,23 +1211,36 @@ impl ObjC {
                 }
             }
             let metaclass = Self::read_isa(class, mem);
-            for (class, methods) in [
+            for (target, methods) in [
                 (class, data.instance_methods),
                 (metaclass, data.class_methods),
             ] {
-                if methods.is_null() {
-                    continue;
-                }
-
-                let any = self.get_host_object(class).unwrap().as_any();
-                if any.is::<FakeClass>() || any.is::<UnimplementedClass>() {
+                if methods.is_null() || target == nil {
                     continue;
                 }
 
                 // Horrible workaround to avoid double-borrowing self:
-                // temporarily replace the class object.
+                // temporarily replace the class object. `class_host_object_mut`
+                // is used instead of `borrow_mut` so an unregistered or
+                // faked class is skipped instead of producing a phantom object
+                // (which would drop the category's methods on the floor while
+                // still logging success).
+                let Some(placeholder) = self.class_host_object_mut(target) else {
+                    log_dbg!(
+                        "Skipping {} methods of category \"{}\" on {:?}: no mutable class \
+                         host object.",
+                        if target == metaclass {
+                            "class"
+                        } else {
+                            "instance"
+                        },
+                        name,
+                        target,
+                    );
+                    continue;
+                };
                 let mut host_obj = std::mem::replace(
-                    self.borrow_mut::<ClassHostObject>(class),
+                    placeholder,
                     ClassHostObject {
                         name: Default::default(),
                         is_metaclass: Default::default(),
@@ -1236,10 +1271,23 @@ impl ObjC {
                         "class"
                     },
                     host_obj.name,
-                    class,
+                    target,
                 );
                 host_obj.add_methods_from_bin(methods, mem, self);
-                *self.borrow_mut::<ClassHostObject>(class) = host_obj;
+                // Restore the object we temporarily took out of the table. The
+                // accessor cannot have changed identity in between, but if it
+                // somehow did, leaving the empty placeholder behind would make
+                // the class respond to nothing at all, so report that loudly.
+                match self.class_host_object_mut(target) {
+                    Some(slot) => *slot = host_obj,
+                    None => log!(
+                        "Warning: register_bin_categories: class {:?} lost its host object \
+                         while its category \"{}\" was being installed; category methods are \
+                         missing.",
+                        target,
+                        name,
+                    ),
+                }
             }
         }
     }
@@ -1249,11 +1297,21 @@ impl ObjC {
             return true;
         }
 
+        // Strictly typed walk: `class_host_object` never fabricates a phantom
+        // host object for placeholder classes, so a class we stub out reports
+        // "not a subclass" instead of silently pretending its superclass is
+        // `nil` and logging a "SUPER HACK! Faking borrow for wrong-type
+        // object … requested ClassHostObject, actual host type
+        // UnimplementedClass" warning on every call.
         let mut class = class;
-        loop {
-            let &ClassHostObject {
-                superclass: next, ..
-            } = self.borrow(class);
+        // A corrupted class table can contain a superclass cycle (buggy guest
+        // runtime manipulation, or a clobbered `class_t`); real ObjC would
+        // hang, an emulator should not. Bound the walk.
+        for _ in 0..CLASS_HIERARCHY_WALK_LIMIT {
+            let Some(class_object) = self.class_host_object(class) else {
+                return false;
+            };
+            let next = class_object.superclass;
             if next == nil {
                 return false;
             } else if next == superclass {
@@ -1262,6 +1320,7 @@ impl ObjC {
                 class = next;
             }
         }
+        false
     }
 
     /// Check whether `class` is a placeholder for a class touchHLE/HyperHLE
@@ -1361,14 +1420,25 @@ impl ObjC {
     }
 
     pub fn class_is_metaclass(&self, class: Class) -> bool {
-        self.get_host_object(class)
-            .and_then(|host_object| host_object.as_any().downcast_ref::<ClassHostObject>())
-            .is_some_and(|class| class.is_metaclass)
+        // Placeholders carry the flag too; `+isMetaClass`-style introspection
+        // must not report `false` for a class that is genuinely a metaclass
+        // just because its methods are unimplemented.
+        self.class_like_metadata(class)
+            .is_some_and(|(_, is_metaclass)| is_metaclass)
     }
 
+    /// Superclass of `class`, or `nil` when the runtime has no superclass
+    /// information (placeholders, unknown classes, and true root classes).
+    ///
+    /// Returning `nil` for a placeholder is the documented ObjC answer for a
+    /// root class and keeps every superclass-chain walk terminating; the
+    /// alternative the runtime used to take — borrowing a phantom
+    /// `ClassHostObject` — allocated leaked scratch memory, logged a "SUPER
+    /// HACK" warning and produced an *empty* name for the class.
     pub fn get_superclass(&self, class: Class) -> Class {
-        let &ClassHostObject { superclass, .. } = self.borrow(class);
-        superclass
+        self.class_host_object(class)
+            .map(|class_object| class_object.superclass)
+            .unwrap_or(nil)
     }
 
     pub fn try_get_class_name(&self, class: Class) -> Option<&str> {
@@ -1465,22 +1535,41 @@ pub fn objc_exception_throw(env: &mut crate::Environment, name: ConstPtr<u8>) ->
     nil
 }
 
-pub fn object_getClassName(env: &mut crate::Environment, obj: id) -> Class {
-    if obj.is_null() {
-        return nil;
+/// `const char *object_getClassName(id obj)`
+///
+/// Apple: "Returns the class name of a given object."
+/// <https://developer.apple.com/documentation/objectivec/1418629-object_getclassname>
+///
+/// Like `class_getName` the returned pointer is a C string owned by the
+/// runtime. This used to return the object's `isa` *pointer* instead, so a
+/// guest doing `strcmp(object_getClassName(obj), "NSString")` compared a class
+/// pointer against a string literal — reading guest text from whatever the
+/// class object happened to contain. Returning the real name also means the
+/// function works for objects whose class we only stub out.
+pub fn object_getClassName(env: &mut crate::Environment, obj: id) -> ConstPtr<u8> {
+    let class = object_class_or_nil(env, obj);
+    if class.is_null() {
+        return ConstPtr::null();
     }
-
-    let objc_obj: objc_object = env.mem.read(obj.cast());
-    objc_obj.isa
+    class_getName(env, class)
 }
 
+/// `Class object_getClass(id obj)`
+///
+/// Apple: "Returns the class of an object."
+/// <https://developer.apple.com/documentation/objectivec/1418511-object_getclass>
+///
+/// A pointer that does not address readable guest memory (a dangling object
+/// address, or plain garbage) has no class; the real runtime would fault there,
+/// but the emulator must not take the process down for a guest bug, so `nil` is
+/// returned and the caller behaves as if the message had been sent to `nil`.
 pub fn object_getClass(env: &mut crate::Environment, obj: id) -> Class {
-    if obj.is_null() {
-        return nil;
-    }
+    object_class_or_nil(env, obj)
+}
 
-    let objc_obj: objc_object = env.mem.read(obj.cast());
-    objc_obj.isa
+/// Read an object's `isa` without panicking on unreadable memory.
+fn object_class_or_nil(env: &crate::Environment, obj: id) -> Class {
+    ObjC::try_read_isa(obj, &env.mem).unwrap_or(nil)
 }
 
 /// ARC return-value helpers use the ordinary retain/autorelease fallback.
@@ -1519,27 +1608,26 @@ pub fn class_getSuperclass(env: &mut crate::Environment, cls: Class) -> Class {
     env.objc.get_superclass(cls)
 }
 
-pub fn class_getInstanceSize(env: &mut crate::Environment, cls: Class, name: SEL) -> ConstVoidPtr {
+/// `size_t class_getInstanceSize(Class cls)`
+///
+/// Apple: "Returns the size of instances of a class."
+/// <https://developer.apple.com/documentation/objectivec/1418530-class_getinstancesize>
+///
+/// The size includes the `isa` pointer and all ivars up to and including the
+/// ones this class itself declares; a class that only *inherits* ivars reports
+/// its superclass's size. `0` is returned for `Nil` and for unknown classes
+/// (Apple documents `Nil` behaviour loosely; returning 0 keeps callers that
+/// multiply by the size from corrupting their own bookkeeping).
+///
+/// This function previously had the signature of `class_getInstanceMethod`
+/// (`(Class, SEL) -> Class`) and returned the *defining class pointer* instead
+/// of a size. Any guest using it to allocate a byte copy of an object sized its
+/// allocation off an address.
+pub fn class_getInstanceSize(env: &mut crate::Environment, cls: Class) -> GuestUSize {
     if cls.is_null() {
-        return ConstVoidPtr::null();
+        return 0;
     }
-
-    let mut curr = cls;
-    while !curr.is_null() {
-        if let Some(host_obj) = env.objc.get_host_object(curr) {
-            if let Some(class_obj) = host_obj.as_any().downcast_ref::<ClassHostObject>() {
-                if class_obj.methods.contains_key(&name) {
-                    return curr.cast_const().cast();
-                }
-            }
-        }
-        let next = env.objc.get_superclass(curr);
-        if next == curr {
-            break;
-        }
-        curr = next;
-    }
-    ConstVoidPtr::null()
+    env.objc.class_instance_size(cls)
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -1626,9 +1714,19 @@ fn imp_at(env: &crate::Environment, cls: Class, sel: SEL) -> Option<IMP> {
 }
 
 /// Install `imp` for `sel` directly on `cls` (no inheritance walk).
-fn set_imp_at(env: &mut crate::Environment, cls: Class, sel: SEL, imp: IMP) {
-    let class_obj = env.objc.borrow_mut::<ClassHostObject>(cls);
+///
+/// Returns `false` if `cls` has no mutable class host object (a faked class
+/// from a defunct SDK, or a pointer that is not a class at all), in which case
+/// nothing is installed. Previously this went through
+/// `borrow_mut::<ClassHostObject>`, which on such a class handed back a leaked
+/// phantom object: the implementation was silently dropped while the caller
+/// still reported success.
+fn set_imp_at(env: &mut crate::Environment, cls: Class, sel: SEL, imp: IMP) -> bool {
+    let Some(class_obj) = env.objc.class_host_object_mut(cls) else {
+        return false;
+    };
     class_obj.methods.insert(sel, imp);
+    true
 }
 
 /// Convert an [IMP] into the guest pointer that Apple's `IMP` type is (a
@@ -1805,7 +1903,13 @@ pub fn method_setImplementation(
     };
     let old = imp_at(env, cls, sel);
     if let Some(new_imp) = guest_ptr_to_imp(env, imp) {
-        set_imp_at(env, cls, sel, new_imp);
+        if !set_imp_at(env, cls, sel, new_imp) {
+            log!(
+                "Warning: method_setImplementation: class {:?} has no editable method table \
+                 (placeholder or faked class); the implementation was not installed.",
+                cls,
+            );
+        }
     }
     match old {
         Some(old_imp) => imp_to_guest_ptr(env, cls, sel, old_imp),
@@ -2099,10 +2203,19 @@ pub fn class_replaceMethod(
     // (it is treated as a request to install the forwarding IMP); we simply
     // leave the existing implementation in place and return it.
     if let Some(new_imp) = guest_ptr_to_imp(env, imp) {
-        set_imp_at(env, cls, name, new_imp);
+        let installed = set_imp_at(env, cls, name, new_imp);
         if !types.is_null() {
-            let class_obj = env.objc.borrow_mut::<ClassHostObject>(cls);
-            class_obj.guest_method_signatures.insert(name, types);
+            if let Some(class_obj) = env.objc.class_host_object_mut(cls) {
+                class_obj.guest_method_signatures.insert(name, types);
+            }
+        }
+        if !installed {
+            log!(
+                "Warning: class_replaceMethod({:?}, {:?}) — the class has no editable \
+                 method table (placeholder or faked class); nothing was replaced.",
+                cls,
+                name.as_str(&env.mem),
+            );
         }
     }
 
@@ -2187,11 +2300,21 @@ pub fn class_addMethod(
     // pass the raw bits straight through.
     let guest_imp = crate::abi::GuestFunction::from_addr_with_thumb_bit(imp.to_bits());
 
-    // Install the new method. `borrow_mut::<ClassHostObject>` walks any
-    // host-object inheritance chain so this works for both classes and
-    // metaclasses (whose host objects are both `ClassHostObject`).
+    // Install the new method. `class_host_object_mut` walks any host-object
+    // inheritance chain (so this works for classes and metaclasses) and, for a
+    // class we only stubbed out, upgrades the placeholder to a real class host
+    // object first — otherwise the method would land in a phantom object and
+    // never be dispatchable.
     {
-        let class_obj = env.objc.borrow_mut::<ClassHostObject>(cls);
+        let Some(class_obj) = env.objc.class_host_object_mut(cls) else {
+            log!(
+                "Warning: class_addMethod({:?}, {:?}) — the class cannot take methods \
+                 (faked class); behaving as Apple's runtime does for an immutable class.",
+                cls,
+                name.as_str(&env.mem),
+            );
+            return false;
+        };
         class_obj
             .methods
             .insert(name, super::methods::IMP::Guest(guest_imp));
@@ -2586,6 +2709,9 @@ pub fn class_getName(env: &mut crate::Environment, cls: Class) -> ConstPtr<u8> {
         // pointer to keep the call safe.
         return Ptr::null();
     }
+    if let Some(&cached) = env.objc.class_name_cstrings.get(&cls) {
+        return cached.cast_const();
+    }
     let name = env.objc.get_class_name(cls).to_owned();
     let bytes = name.as_bytes();
     let len: u32 = bytes.len() as u32 + 1;
@@ -2594,6 +2720,9 @@ pub fn class_getName(env: &mut crate::Environment, cls: Class) -> ConstPtr<u8> {
         env.mem.write(buf + i as u32, b);
     }
     env.mem.write(buf + bytes.len() as u32, 0);
+    // Cache so repeated calls return the same pointer, as documented above
+    // and as real ObjC guarantees.
+    env.objc.class_name_cstrings.insert(cls, buf.cast());
     buf.cast_const()
 }
 
@@ -2708,7 +2837,15 @@ pub fn class_setSuperclass(env: &mut crate::Environment, cls: Class, new_super: 
         return nil;
     }
     let old = env.objc.get_superclass(cls);
-    env.objc.borrow_mut::<ClassHostObject>(cls).superclass = new_super;
+    match env.objc.class_host_object_mut(cls) {
+        Some(class_obj) => class_obj.superclass = new_super,
+        None => log!(
+            "Warning: class_setSuperclass({:?}, {:?}) — the class has no editable \
+             superclass slot (faked class); ignoring.",
+            cls,
+            new_super,
+        ),
+    }
     old
 }
 
@@ -3088,8 +3225,7 @@ pub fn method_exchangeImplementations(
     if let Some(imp) = imp1 {
         set_imp_at(env, cls2, sel2, imp);
     }
-    {
-        let class_obj = env.objc.borrow_mut::<ClassHostObject>(cls1);
+    if let Some(class_obj) = env.objc.class_host_object_mut(cls1) {
         match types2 {
             Some(t) => {
                 class_obj.guest_method_signatures.insert(sel1, t);
@@ -3099,8 +3235,7 @@ pub fn method_exchangeImplementations(
             }
         }
     }
-    {
-        let class_obj = env.objc.borrow_mut::<ClassHostObject>(cls2);
+    if let Some(class_obj) = env.objc.class_host_object_mut(cls2) {
         match types1 {
             Some(t) => {
                 class_obj.guest_method_signatures.insert(sel2, t);

@@ -89,6 +89,53 @@ impl VsyncMode {
     }
 }
 
+/// How touchHLE answers HTTP requests addressed to third-party analytics and
+/// advertising services that no longer exist (`--legacy-analytics=`).
+///
+/// Several services bundled into 2009–2014 iPhone games — PlayHaven among them
+/// — shut down years ago, but their SDKs still run during app launch and try to
+/// contact them. On a device today that attempt fails quickly. In the emulator,
+/// letting it go out to the network can block the emulator thread on a name
+/// lookup, which freezes the guest before its first frame (the classic "black
+/// screen after the publisher's logo").
+///
+/// Requests to those endpoints are therefore answered locally by default:
+///
+/// * [`Self::MockServiceUnavailable`] — reply immediately with a synthetic
+///   `503 Service Unavailable` (plus a JSON body) without any DNS lookup or
+///   socket. Legacy SDKs treat a 5xx as "service down" and let the game
+///   continue.
+/// * [`Self::FailFast`] — fail immediately with
+///   `NSURLErrorCannotFindHost`, i.e. the observable result of the DNS records
+///   being gone.
+/// * [`Self::Passthrough`] — no interception; the request behaves like any
+///   other (subject to `--allow-network-access`).
+///
+/// Only the known-defunct domains are affected (see
+/// [crate::frameworks::foundation::legacy_analytics]); everything else is
+/// untouched.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum LegacyAnalyticsMode {
+    /// Answer with a synthetic `503 Service Unavailable` (default).
+    #[default]
+    MockServiceUnavailable,
+    /// Fail immediately with "cannot find host".
+    FailFast,
+    /// Do not intercept; use the real network stack.
+    Passthrough,
+}
+
+impl LegacyAnalyticsMode {
+    pub fn from_short_name(name: &str) -> Result<Self, ()> {
+        match name {
+            "mock" | "mock-503" | "503" => Ok(Self::MockServiceUnavailable),
+            "fail" | "fail-fast" | "refuse" => Ok(Self::FailFast),
+            "passthrough" | "off" | "real" => Ok(Self::Passthrough),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Struct containing all user-configurable options.
 #[derive(Clone)]
 pub struct Options {
@@ -217,6 +264,9 @@ pub struct Options {
     /// Apps that are ES 2.0-only will fail to create a context with this set.
     pub force_gles1_context: bool,
     pub network_access: bool,
+    /// Policy for requests to retired analytics/ad endpoints.
+    /// See [LegacyAnalyticsMode].
+    pub legacy_analytics: LegacyAnalyticsMode,
     pub popup_errors: bool,
     pub dumping_options: DumpingOptions,
     pub dumping_file: PathBuf,
@@ -353,6 +403,7 @@ impl Default for Options {
                 })
                 .unwrap_or(false),
             network_access: false,
+            legacy_analytics: LegacyAnalyticsMode::default(),
             popup_errors: true,
             dumping_options: Default::default(),
             dumping_file: crate::paths::user_data_base_path().join("DUMP.txt"),
@@ -674,6 +725,11 @@ impl Options {
             self.network_access = true;
         } else if arg == "--no-network-access" {
             self.network_access = false;
+        } else if let Some(value) = arg.strip_prefix("--legacy-analytics=") {
+            self.legacy_analytics = LegacyAnalyticsMode::from_short_name(value).map_err(|_| {
+                "Invalid value for --legacy-analytics= (expected mock, fail or passthrough)"
+                    .to_string()
+            })?;
         } else if arg == "--no-error-popup" {
             self.popup_errors = false;
         } else if let Some(values) = arg.strip_prefix("--dump=") {
@@ -832,6 +888,38 @@ mod option_parsing_tests {
             .parse_argument("--no-reverse-attrib-locations")
             .unwrap());
         assert!(!options.reverse_attrib_locations);
+    }
+
+    #[test]
+    fn legacy_analytics_mode_is_configurable_by_argument() {
+        let mut options = Options::default();
+        // Requests to retired ad/analytics endpoints are answered locally by
+        // default, because those services no longer resolve and a real lookup
+        // can freeze launch (see `dns_lookup` and `legacy_analytics`).
+        assert_eq!(
+            options.legacy_analytics,
+            LegacyAnalyticsMode::MockServiceUnavailable
+        );
+
+        assert!(options.parse_argument("--legacy-analytics=fail").unwrap());
+        assert_eq!(options.legacy_analytics, LegacyAnalyticsMode::FailFast);
+        assert!(options
+            .parse_argument("--legacy-analytics=passthrough")
+            .unwrap());
+        assert_eq!(options.legacy_analytics, LegacyAnalyticsMode::Passthrough);
+        assert!(options.parse_argument("--legacy-analytics=mock").unwrap());
+        assert_eq!(
+            options.legacy_analytics,
+            LegacyAnalyticsMode::MockServiceUnavailable
+        );
+
+        // A typo must be an error rather than a silent "passthrough": silently
+        // turning the interception off is what brings the start-up hang back.
+        assert!(options.parse_argument("--legacy-analytics=bogus").is_err());
+        assert_eq!(
+            options.legacy_analytics,
+            LegacyAnalyticsMode::MockServiceUnavailable
+        );
     }
 
     #[test]

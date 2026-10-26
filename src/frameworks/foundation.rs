@@ -25,6 +25,7 @@ pub mod _nib_archive_decoder;
 pub mod ab_people_picker_navigation_controller;
 pub mod asidentifier_manager;
 pub mod chipmunk_space;
+pub mod legacy_analytics;
 pub mod ns_array;
 pub mod ns_attributed_string;
 pub mod ns_assertion_handler;

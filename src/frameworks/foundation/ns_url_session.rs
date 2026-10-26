@@ -423,7 +423,11 @@ fn start_task_network(env: &mut crate::Environment, task: id) {
     let bytes_sent = request_data.as_ref().map_or(0, |request| {
         request.body.len().min(i64::MAX as usize) as i64
     });
-    let receiver = url_loading::send_async(request_data, env.options.network_access);
+    let receiver = url_loading::send_async(
+        request_data,
+        env.options.network_access,
+        env.options.legacy_analytics,
+    );
     {
         let host = env.objc.borrow_mut::<NSURLSessionTaskHostObject>(task);
         host.bytes_sent = bytes_sent;

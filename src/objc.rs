@@ -26,6 +26,7 @@ use crate::fastmap::{FxHashMap, FxHashSet};
 use crate::MutexId;
 
 mod classes;
+mod dispatch_guard;
 mod messages;
 mod methods;
 mod objects;
@@ -213,6 +214,37 @@ pub struct ObjC {
     /// `method_getImplementation(m) == method_getImplementation(m)` holds,
     /// matching Apple's behaviour.
     pub(super) host_imp_tokens: FxHashMap<usize, crate::mem::MutVoidPtr>,
+
+    /// Recently deallocated object addresses, with the class they had when
+    /// they died.
+    ///
+    /// `mem.free` zeroes the freed block (see [crate::mem::Mem::free]), so once
+    /// the guest sends a message to a dangling pointer its `isa` reads back as
+    /// `nil` and there is no way to tell *what* was freed. That made the
+    /// previous "receiver has nil isa!" warning impossible to act on: it named
+    /// neither the class nor the code path. Recording the identity at
+    /// deallocation time turns that message into an actionable use-after-free
+    /// report (class + object address + selector + dispatch chain).
+    ///
+    /// This is diagnostics-only bookkeeping: it never resurrects objects and
+    /// never makes a freed address look valid. Entries are dropped again when
+    /// the guest allocator hands the same address out (see
+    /// [Self::forget_freed_object]), so a recycled address is not reported as
+    /// a stale one.
+    pub(super) freed_objects: FxHashMap<id, objects::FreedObjectRecord>,
+
+    /// Insertion order for [Self::freed_objects], used to bound its size.
+    pub(super) freed_object_order: std::collections::VecDeque<id>,
+
+    /// Guest C strings returned by `class_getName`/`object_getClassName`,
+    /// keyed by class.
+    ///
+    /// Apple guarantees that `class_getName` returns the same pointer for a
+    /// class's whole lifetime (it returns the name stored in the class's
+    /// read-only data), and guest code caches and pointer-compares it. The
+    /// previous implementation allocated a fresh C string on every call, so two
+    /// calls never compared equal and every call leaked guest memory.
+    pub(super) class_name_cstrings: FxHashMap<Class, crate::mem::MutVoidPtr>,
 }
 
 impl ObjC {
@@ -231,6 +263,9 @@ impl ObjC {
             method_handles: FxHashMap::default(),
             imp_tokens: FxHashMap::default(),
             host_imp_tokens: FxHashMap::default(),
+            freed_objects: FxHashMap::default(),
+            freed_object_order: std::collections::VecDeque::new(),
+            class_name_cstrings: FxHashMap::default(),
         }
     }
 
@@ -421,7 +456,7 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(objc_begin_catch(_)),
     export_c_func!(objc_end_catch(_)),
     export_c_func!(class_getSuperclass(_)),
-    export_c_func!(class_getInstanceSize(_, _)),
+    export_c_func!(class_getInstanceSize(_)),
     export_c_func!(class_getInstanceVariable(_, _)),
     export_c_func!(object_getIvar(_, _)),
     export_c_func!(object_setIvar(_, _, _)),

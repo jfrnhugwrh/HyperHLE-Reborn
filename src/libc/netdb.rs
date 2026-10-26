@@ -13,7 +13,7 @@ use crate::libc::sys::socket::{
 };
 use crate::mem::{guest_size_of, ConstPtr, ConstVoidPtr, MutPtr, Ptr, SafeRead};
 use crate::Environment;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const AI_PASSIVE: i32 = 0x1;
 const AI_CANONNAME: i32 = 0x2;
@@ -146,15 +146,36 @@ fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
     s.parse::<std::net::Ipv4Addr>().ok().map(|a| a.octets())
 }
 
+/// Resolve `hostname` through touchHLE's bounded resolver.
+///
+/// This used to call `ToSocketAddrs` directly on the emulator thread. A host
+/// resolver that is slow or unreachable (no DNS in a sandbox, a black-holing
+/// ISP) therefore froze the whole emulator inside `getaddrinfo` — which is how
+/// a guest analytics SDK's retry loop turned into a black screen. The shared
+/// resolver bounds every lookup, caches failures (including timeouts) and
+/// refuses hostnames of services that no longer exist; see
+/// [crate::libc::dns_lookup].
 fn resolve_hostname_ips(hostname: &str) -> Option<Vec<IpAddr>> {
-    let mut addresses = Vec::new();
-    for address in (hostname, 0u16).to_socket_addrs().ok()? {
-        let ip = address.ip();
-        if !addresses.contains(&ip) {
-            addresses.push(ip);
+    match crate::libc::dns_lookup::resolve_socket_addresses(hostname) {
+        Ok(addresses) => {
+            let mut ips = Vec::with_capacity(addresses.len());
+            for address in addresses {
+                let ip = address.ip();
+                if !ips.contains(&ip) {
+                    ips.push(ip);
+                }
+            }
+            (!ips.is_empty()).then_some(ips)
+        }
+        Err(error) => {
+            log_dbg!(
+                "getaddrinfo: {:?} could not be resolved: {}",
+                hostname,
+                error.description()
+            );
+            None
         }
     }
-    (!addresses.is_empty()).then_some(addresses)
 }
 
 fn resolve_host_addresses(hostname: &str, network_access: bool) -> Option<Vec<IpAddr>> {
@@ -345,19 +366,28 @@ fn alloc_hostent(
 
 // MARK: - gethostbyname / gethostbyaddr
 
-/// Resolve a hostname to an IPv4 address by asking the host OS's resolver.
+/// Resolve a hostname to an IPv4 address.
 ///
 /// Used by `gethostbyname` and `getaddrinfo`. Returns `None` when the lookup
-/// fails or when the hostname has no IPv4 record. This is a blocking call.
+/// fails or when the hostname has no IPv4 record.
+///
+/// The lookup goes through touchHLE's bounded, cached resolver rather than
+/// `ToSocketAddrs` directly: an unbounded call here blocks the emulator thread
+/// (and with it every guest thread) for as long as the host resolver takes,
+/// which is what "the game freezes while the ad SDK starts" looks like from the
+/// outside.
 fn resolve_hostname_ipv4(hostname: &str) -> Option<[u8; 4]> {
-    // Port 0 is just a placeholder; we only care about the resolved address.
-    let addrs = (hostname, 0u16).to_socket_addrs().ok()?;
-    for addr in addrs {
-        if let std::net::SocketAddr::V4(v4) = addr {
-            return Some(v4.ip().octets());
+    match crate::libc::dns_lookup::resolve_ipv4_addresses(hostname) {
+        Ok(addresses) => addresses.first().map(|address| address.ip().octets()),
+        Err(error) => {
+            log_dbg!(
+                "gethostbyname: {:?} could not be resolved: {}",
+                hostname,
+                error.description()
+            );
+            None
         }
     }
-    None
 }
 
 fn gethostbyname(env: &mut Environment, name: ConstPtr<u8>) -> MutPtr<u8> {

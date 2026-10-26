@@ -15,6 +15,10 @@ Changes are categorised as follows:
 
 ## NEXT
 
+Compatibility:
+
+- This fork is now **UltraHLE Rebirth**. It has its own Android package identity (`org.ultrahle.rebirth`, previously `org.hyperhle.reborn`), its own signing key (a new committed `android/keystore/release.keystore`, certificate CN=UltraHLE Rebirth), its own device label ("UltraHLE Rebirth"), and renamed APK/release artifacts (`UltraHLE-Rebirth-release.apk`, `UltraHLE-Rebirth_Android_AArch64.zip`). It therefore installs side-by-side with the main HyperHLE-Reborn app instead of overriding it, with its own separate app data. CI keystore secrets were renamed from `HYPERHLE_*` to `ULTRAHLE_*` accordingly.
+
 Quality and performance:
 
 - Startup and runtime no longer pay for per-call debug tracing on the hottest emulator paths. Several verbose traces had been left as unconditional output that ran on *every* occurrence: `-[NSString stringWithFormat:]` formatting, every UTF-16 conversion of an `NSString`, `-[NSMutableString mergeWithPrevious:]`, and the `objectAtIndexedSubscript:` NSArray-literal compatibility shim. On string/array-heavy apps this fired thousands of times before the first frame — on Doodle Jump roughly 85% of all log lines during launch came from these — and each line was a synchronous write to stderr plus the on-disk log, stalling the thread that runs the emulated CPU. They are now gated behind `log_dbg!` (off by default), so they stay available for debugging but cost nothing in normal use. Measured locally (release, software renderer) this cut Turbo Dismount's time-to-first-frame from ~9s to ~5s and shrank Doodle Jump's launch log from several thousand lines to a few hundred. (@j92580498-max)

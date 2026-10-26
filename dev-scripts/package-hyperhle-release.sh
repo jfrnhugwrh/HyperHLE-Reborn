@@ -1,5 +1,5 @@
 #!/bin/sh
-# Package the HyperHLE Android release zip and write release notes for
+# Package the UltraHLE Rebirth Android release zip and write release notes for
 # action-gh-release. This fork only ships Android builds.
 set -eu
 
@@ -17,7 +17,7 @@ cd "$ROOT"
 # This fork only ships Android builds; the APK is the only artifact.
 android_apk=""
 for candidate in \
-    artifacts/android/HyperHLE-Reborn.apk \
+    artifacts/android/UltraHLE-Rebirth.apk \
     artifacts/android/touchHLE.apk
 do
     if [ -e "$candidate" ]; then
@@ -100,8 +100,8 @@ write_changelog() {
 }
 
 {
-    printf '%s\n\n' "HyperHLE ${VERSION}"
-    if [ "${FORCE_HYPERHLE_RELEASE:-}" = "true" ]; then
+    printf '%s\n\n' "UltraHLE Rebirth ${VERSION}"
+    if [ "${FORCE_ULTRAHLE_RELEASE:-}" = "true" ]; then
         printf '%s\n\n' "_Manual release — changelog shows the latest 6 commits._"
     fi
     printf '%s\n\n' "## Changelog"
@@ -117,7 +117,7 @@ write_changelog() {
 cd "$ROOT/dev-scripts"
 ./prepare-release.sh --prepare-files
 
-prefix="HyperHLE"
+prefix="UltraHLE-Rebirth"
 
 ./prepare-release.sh --create-zip-android "$ROOT/$android_apk" \
     -o "$ROOT/release/${prefix}_Android_AArch64.zip"

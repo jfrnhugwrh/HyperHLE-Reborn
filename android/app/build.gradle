@@ -47,11 +47,11 @@ def getTouchHLEVersionCode() {
 
 
 
-def hyperHLEKeystoreFile = System.getenv('HYPERHLE_KEYSTORE_FILE')
-def hyperHLEKeystoreB64 = System.getenv('HYPERHLE_KEYSTORE_B64')
+def hyperHLEKeystoreFile = System.getenv('ULTRAHLE_KEYSTORE_FILE')
+def hyperHLEKeystoreB64 = System.getenv('ULTRAHLE_KEYSTORE_B64')
 def hyperHLEUsesExternalKey = (hyperHLEKeystoreB64 != null && !hyperHLEKeystoreB64.trim().isEmpty()) || (hyperHLEKeystoreFile != null && !hyperHLEKeystoreFile.trim().isEmpty())
-def hyperHLEKeystorePass = System.getenv('HYPERHLE_KEYSTORE_PASSWORD') ?: 'hyperhle'
-def hyperHLEKeyAlias = System.getenv('HYPERHLE_KEY_ALIAS') ?: 'hyperhle'
+def hyperHLEKeystorePass = System.getenv('ULTRAHLE_KEYSTORE_PASSWORD') ?: 'ultrahle'
+def hyperHLEKeyAlias = System.getenv('ULTRAHLE_KEY_ALIAS') ?: 'ultrahle'
 def hyperHLECommittedKeystore = file("${rootDir}/keystore/release.keystore")
 def hyperHLEHasReleaseKey = hyperHLEUsesExternalKey || hyperHLECommittedKeystore.exists()
 
@@ -62,7 +62,7 @@ android {
     signingConfigs {
         release {
             if (hyperHLEKeystoreB64 != null && !hyperHLEKeystoreB64.trim().isEmpty()) {
-                def tmp = File.createTempFile('hyperhle', '.keystore')
+                def tmp = File.createTempFile('ultrahle', '.keystore')
                 tmp.deleteOnExit()
                 tmp.bytes = hyperHLEKeystoreB64.decodeBase64()
                 storeFile tmp
@@ -85,10 +85,10 @@ android {
     }
     defaultConfig {
         def branding = getTouchHLEBranding()
-        applicationId 'org.hyperhle.reborn'
+        applicationId 'org.ultrahle.rebirth'
         applicationIdSuffix(branding.isEmpty() ? null : '.' + branding.toLowerCase())
-        resValue 'string', 'app_name', join('HyperHLE-Reborn', ' ', branding)
-        buildConfigField 'String', 'APP_NAME', ('"' + join('HyperHLE-Reborn', ' ', branding) + '"')
+        resValue 'string', 'app_name', join('UltraHLE Rebirth', ' ', branding)
+        buildConfigField 'String', 'APP_NAME', ('"' + join('UltraHLE Rebirth', ' ', branding) + '"')
         manifestPlaceholders = [
                 icon: (branding.toLowerCase() == 'unofficial' ? '@drawable/icon' : join('@drawable/icon', '_', branding.toLowerCase()))
         ]
@@ -145,7 +145,7 @@ android {
         tasks["merge${variant.name.capitalize()}Assets"]
                 .dependsOn("externalNativeBuild${variant.name.capitalize()}")
         variant.outputs.all { output ->
-            outputFileName = "HyperHLE-Reborn-${variant.name}.apk"
+            outputFileName = "UltraHLE-Rebirth-${variant.name}.apk"
         }
     }
 

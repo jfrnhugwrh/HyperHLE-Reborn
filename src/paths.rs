@@ -181,7 +181,7 @@ pub fn user_data_base_path() -> Cow<'static, Path> {
 /// `android/app/build.gradle`. The documents provider is registered with
 /// `${applicationId}.provider` as its authority, so this must be kept in sync
 /// with the Gradle file (only the branding suffix is appended separately).
-const ANDROID_APPLICATION_ID: &str = "org.hyperhle.reborn";
+const ANDROID_APPLICATION_ID: &str = "org.ultrahle.rebirth";
 
 /// The authority of the documents provider that exposes the user data
 /// directory to the system file manager on Android. A build with branding

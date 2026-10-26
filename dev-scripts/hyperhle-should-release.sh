@@ -49,7 +49,7 @@ fi
 
 version="v${major}.${minor}.${patch}"
 
-if [ "${FORCE_HYPERHLE_RELEASE:-}" = "true" ]; then
+if [ "${FORCE_ULTRAHLE_RELEASE:-}" = "true" ]; then
     should_release=true
 elif [ "${GITHUB_EVENT_NAME:-}" = "workflow_dispatch" ]; then
     # Manual "Build HyperHLE" runs must never publish files to Releases;
@@ -64,7 +64,7 @@ else
 fi
 
 if [ "$should_release" = true ]; then
-    if [ "${FORCE_HYPERHLE_RELEASE:-}" = "true" ]; then
+    if [ "${FORCE_ULTRAHLE_RELEASE:-}" = "true" ]; then
         # Manual release: publish script uses git log -n 6 (see changelog_limit).
         changelog_from=""
         changelog_limit=6

@@ -1,10 +1,10 @@
-name: Build HyperHLE
+name: Build UltraHLE Rebirth
 
 on:
   workflow_dispatch:
     inputs:
-      publish_hyperhle_release:
-        description: Publish a HyperHLE release (after all builds succeed)
+      publish_ultrahle_release:
+        description: Publish an UltraHLE Rebirth release (after all builds succeed)
         type: boolean
         default: false
   push:
@@ -126,45 +126,45 @@ jobs:
         java-version: '17'
 
     - name: Build for Android  
-      run: cd android && ../gradle/gradle-8.11.1/bin/gradle assembleRelease && mv app/build/outputs/apk/release/HyperHLE-Reborn-release.apk ../HyperHLE-Reborn.apk  
+      run: cd android && ../gradle/gradle-8.11.1/bin/gradle assembleRelease && mv app/build/outputs/apk/release/UltraHLE-Rebirth-release.apk ../UltraHLE-Rebirth.apk  
       env:  
-        HYPERHLE_KEYSTORE_B64: ${{ secrets.HYPERHLE_KEYSTORE_B64 }}
-        HYPERHLE_KEYSTORE_PASSWORD: ${{ secrets.HYPERHLE_KEYSTORE_PASSWORD }}
-        HYPERHLE_KEY_ALIAS: ${{ secrets.HYPERHLE_KEY_ALIAS }}
+        ULTRAHLE_KEYSTORE_B64: ${{ secrets.ULTRAHLE_KEYSTORE_B64 }}
+        ULTRAHLE_KEYSTORE_PASSWORD: ${{ secrets.ULTRAHLE_KEYSTORE_PASSWORD }}
+        ULTRAHLE_KEY_ALIAS: ${{ secrets.ULTRAHLE_KEY_ALIAS }}
         ANDROID_NDK_ROOT: '/usr/local/lib/android/sdk/ndk/25.2.9519653'  
         CMAKE: ${{ github.workspace }}/vendor/cmake/bin/cmake  
 
     - name: Apply APK v3 key-rotation lineage (if configured)
       env:
-        HYPERHLE_KEY_LINEAGE_B64: ${{ secrets.HYPERHLE_KEY_LINEAGE_B64 }}
-        HYPERHLE_KEYSTORE_B64: ${{ secrets.HYPERHLE_KEYSTORE_B64 }}
-        HYPERHLE_KEYSTORE_PASSWORD: ${{ secrets.HYPERHLE_KEYSTORE_PASSWORD }}
-        HYPERHLE_KEY_ALIAS: ${{ secrets.HYPERHLE_KEY_ALIAS }}
+        ULTRAHLE_KEY_LINEAGE_B64: ${{ secrets.ULTRAHLE_KEY_LINEAGE_B64 }}
+        ULTRAHLE_KEYSTORE_B64: ${{ secrets.ULTRAHLE_KEYSTORE_B64 }}
+        ULTRAHLE_KEYSTORE_PASSWORD: ${{ secrets.ULTRAHLE_KEYSTORE_PASSWORD }}
+        ULTRAHLE_KEY_ALIAS: ${{ secrets.ULTRAHLE_KEY_ALIAS }}
       run: |
         set -euo pipefail
-        if [ -z "${HYPERHLE_KEY_LINEAGE_B64:-}" ] || [ -z "${HYPERHLE_KEYSTORE_B64:-}" ]; then
+        if [ -z "${ULTRAHLE_KEY_LINEAGE_B64:-}" ] || [ -z "${ULTRAHLE_KEYSTORE_B64:-}" ]; then
           exit 0
         fi
         APKSIGNER="$(ls -1 "$ANDROID_SDK_ROOT"/build-tools/*/apksigner | sort -V | tail -n1)"
         KS_TMP="$(mktemp --suffix=.keystore)"
         LIN_TMP="$(mktemp --suffix=.lineage)"
         trap 'rm -f "$KS_TMP" "$LIN_TMP"' EXIT
-        printf '%s' "$HYPERHLE_KEYSTORE_B64" | base64 -d > "$KS_TMP"
-        printf '%s' "$HYPERHLE_KEY_LINEAGE_B64" | base64 -d > "$LIN_TMP"
+        printf '%s' "$ULTRAHLE_KEYSTORE_B64" | base64 -d > "$KS_TMP"
+        printf '%s' "$ULTRAHLE_KEY_LINEAGE_B64" | base64 -d > "$LIN_TMP"
         "$APKSIGNER" sign \
           --ks "$KS_TMP" \
-          --ks-key-alias "${HYPERHLE_KEY_ALIAS:-hyperhle}" \
-          --ks-pass env:HYPERHLE_KEYSTORE_PASSWORD \
+          --ks-key-alias "${ULTRAHLE_KEY_ALIAS:-ultrahle}" \
+          --ks-pass env:ULTRAHLE_KEYSTORE_PASSWORD \
           --v1-signing-enabled true \
           --v2-signing-enabled true \
           --v3-signing-enabled true \
           --lineage "$LIN_TMP" \
-          HyperHLE-Reborn.apk
+          UltraHLE-Rebirth.apk
 
     - uses: actions/upload-artifact@main
       with:  
-        name: HyperHLE_Android_AArch64  
-        path: HyperHLE-Reborn.apk
+        name: UltraHLE_Android_AArch64  
+        path: UltraHLE-Rebirth.apk
 
   check-hyperhle-release:
     runs-on: ubuntu-latest
@@ -185,7 +185,7 @@ jobs:
       - name: Check whether a HyperHLE release is due
         id: check
         env:
-          FORCE_HYPERHLE_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_hyperhle_release && 'true' || '' }}
+          FORCE_ULTRAHLE_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_ultrahle_release && 'true' || '' }}
         run: ./dev-scripts/hyperhle-should-release.sh
 
   # This fork only ships Android builds, so a release needs nothing but
@@ -209,7 +209,7 @@ jobs:
       - name: Download Android artifact
         uses: actions/download-artifact@main
         with:
-          name: HyperHLE_Android_AArch64
+          name: UltraHLE_Android_AArch64
           path: artifacts/android
       - name: Install packaging tools
         run: sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq pandoc zip
@@ -218,7 +218,7 @@ jobs:
           # Lets the changelog look up each commit author's GitHub username.
           GH_TOKEN: ${{ github.token }}
           GITHUB_SERVER_URL: ${{ github.server_url }}
-          FORCE_HYPERHLE_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_hyperhle_release && 'true' || '' }}
+          FORCE_ULTRAHLE_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_ultrahle_release && 'true' || '' }}
           VERSION: ${{ needs.check-hyperhle-release.outputs.version }}
           CHANGELOG_FROM: ${{ needs.check-hyperhle-release.outputs.changelog_from }}
           CHANGELOG_LIMIT: ${{ needs.check-hyperhle-release.outputs.changelog_limit }}
@@ -229,8 +229,8 @@ jobs:
           tag_name: ${{ needs.check-hyperhle-release.outputs.version }}
           # Tag the commit that was built, not whatever trunk points at by now.
           target_commitish: ${{ github.sha }}
-          name: HyperHLE ${{ needs.check-hyperhle-release.outputs.version }}
+          name: UltraHLE Rebirth ${{ needs.check-hyperhle-release.outputs.version }}
           body_path: release/RELEASE_NOTES.md
           files: |
-            release/HyperHLE_Android_AArch64.zip
+            release/UltraHLE-Rebirth_Android_AArch64.zip
           fail_on_unmatched_files: true

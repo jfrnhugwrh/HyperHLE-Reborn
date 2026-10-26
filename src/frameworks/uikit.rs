@@ -1092,11 +1092,15 @@ pub(crate) fn handle_events_with_result(env: &mut Environment) -> (Option<Instan
                 // treated as a real shutdown.
                 // https://developer.apple.com/documentation/uikit/uiapplicationdelegate/applicationwillresignactive(_:)
                 log_dbg!("Handling app-will-resign-active event.");
+                // The emulator is about to be paused by the host, so a lack of
+                // guest progress from now on is expected, not a hang.
+                crate::stall_watchdog::set_suspended(true);
                 ui_application::handle_will_resign_active(env);
             }
             Event::AppDidEnterBackground => {
                 // https://developer.apple.com/documentation/uikit/uiapplicationdelegate/applicationdidenterbackground(_:)
                 log_dbg!("Handling app-did-enter-background event.");
+                crate::stall_watchdog::set_suspended(true);
                 ui_application::handle_did_enter_background(env);
             }
             Event::AppWillEnterForeground => {
@@ -1107,6 +1111,7 @@ pub(crate) fn handle_events_with_result(env: &mut Environment) -> (Option<Instan
             Event::AppDidBecomeActive => {
                 // https://developer.apple.com/documentation/uikit/uiapplicationdelegate/applicationdidbecomeactive(_:)
                 log_dbg!("Handling app-did-become-active event.");
+                crate::stall_watchdog::set_suspended(false);
                 ui_application::handle_did_become_active(env);
             }
             Event::AppWillTerminate => {

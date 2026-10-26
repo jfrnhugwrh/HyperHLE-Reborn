@@ -142,6 +142,79 @@ public class MainActivity extends SDLActivity {
         return 0;
     }
 
+    // =====================================================================
+    // Log sharing (called from Rust via JNI; see src/log_share.rs and
+    // src/android_web_view.rs).
+    //
+    // The log lives in Android/data/<package>/files, which modern Android
+    // hides from file managers, and most users have no ADB, so handing the
+    // file to the system share sheet is the only way they can pass it on.
+    // The URI is a content:// document of our own DocumentsProvider: no
+    // storage permission is needed, and the receiving app gets a one-off read
+    // grant through FLAG_GRANT_READ_URI_PERMISSION.
+    // =====================================================================
+    public static int shareLogFile(final String subject, final String uriStr) {
+        final android.app.Activity act = mSingleton;
+        if (act == null || uriStr == null || uriStr.isEmpty()) {
+            return -1;
+        }
+        act.runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    android.content.Intent intent = new android.content.Intent(
+                            android.content.Intent.ACTION_SEND);
+                    intent.setType("text/plain");
+                    intent.putExtra(android.content.Intent.EXTRA_STREAM,
+                            android.net.Uri.parse(uriStr));
+                    intent.putExtra(android.content.Intent.EXTRA_SUBJECT, subject);
+                    intent.putExtra(android.content.Intent.EXTRA_TEXT, subject);
+                    intent.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    act.startActivity(android.content.Intent.createChooser(intent, subject));
+                } catch (Throwable t) {
+                    Log.e(TAG, "shareLogFile failed for " + uriStr, t);
+                }
+            }
+        });
+        return 0;
+    }
+
+    // A guest that stopped making progress cannot show anything itself (the
+    // thread that would draw it is stuck), so the Rust stall watchdog asks for
+    // this dialog instead. It is posted to the UI thread, which keeps running
+    // no matter what the emulator thread is blocked on, and its "Share log"
+    // button is what makes a hang reportable while it is happening.
+    public static int showStallDialog(final String message, final String subject,
+            final String uriStr) {
+        final android.app.Activity act = mSingleton;
+        if (act == null) {
+            return -1;
+        }
+        act.runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    new android.app.AlertDialog.Builder(act)
+                            .setTitle("UltraHLE Rebirth seems stuck")
+                            .setMessage(message)
+                            .setPositiveButton("Share log",
+                                    new android.content.DialogInterface.OnClickListener() {
+                                        @Override
+                                        public void onClick(android.content.DialogInterface dialog,
+                                                int which) {
+                                            shareLogFile(subject, uriStr);
+                                        }
+                                    })
+                            .setNegativeButton("Keep waiting", null)
+                            .show();
+                } catch (Throwable t) {
+                    Log.e(TAG, "showStallDialog failed", t);
+                }
+            }
+        });
+        return 0;
+    }
+
     // Open a content:// URI from our DocumentsProvider in the system file
     // manager. This is used for the "File manager" button on Android.
     // Unlike openExternalUrl it always grants URI permissions and uses a

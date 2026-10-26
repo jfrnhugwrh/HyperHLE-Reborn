@@ -439,6 +439,13 @@ mod imp {
         stop_loading: *mut c_void,
         open_url: *mut c_void,
         open_content_uri: *mut c_void,
+        /// `MainActivity.shareLogFile(String, String)`, or null if the Java
+        /// side does not have it (an older .apk). These two are resolved
+        /// leniently: unlike the WebView methods, a missing one must not
+        /// disable the whole bridge.
+        share_log: *mut c_void,
+        /// `MainActivity.showStallDialog(String, String, String)`, or null.
+        stall_dialog: *mut c_void,
     }
 
     // SAFETY: the class is held as a global reference, which is valid from
@@ -493,6 +500,22 @@ mod imp {
                 stop_loading: method(jni, class, "stopLoadingWebOverlay", "(I)V")?,
                 open_url: method(jni, class, "openExternalUrl", "(Ljava/lang/String;)I")?,
                 open_content_uri: method(jni, class, "openContentUri", "(Ljava/lang/String;)I")?,
+                // Optional: resolved without `?`, so a build whose Java side
+                // predates the log-sharing bridge keeps its WebView support.
+                share_log: jni
+                    .get_static_method(
+                        class,
+                        "shareLogFile",
+                        "(Ljava/lang/String;Ljava/lang/String;)I",
+                    )
+                    .unwrap_or(std::ptr::null_mut()),
+                stall_dialog: jni
+                    .get_static_method(
+                        class,
+                        "showStallDialog",
+                        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I",
+                    )
+                    .unwrap_or(std::ptr::null_mut()),
             })
         }
         fn resolve(jni: &Jni) -> Option<JniCache> {
@@ -694,6 +717,64 @@ mod imp {
         jni.delete_local_ref(uri_j);
         ret == 0
     }
+
+    /// Hand a file (as a `content://` URI of our own DocumentsProvider) to the
+    /// system share sheet, so the user can send it to themselves (or to a
+    /// developer) without ADB or a file manager that can see `Android/data`.
+    ///
+    /// Returns false when the Java bridge is unavailable.
+    pub fn share_log_file(subject: &str, uri: &str) -> bool {
+        let Some(jni) = Jni::attach() else {
+            return false;
+        };
+        let Some(c) = cached() else {
+            return false;
+        };
+        if c.share_log.is_null() {
+            return false;
+        }
+        let subject_j = jni.new_jstring(subject);
+        let uri_j = jni.new_jstring(uri);
+        let args = [JValue { l: subject_j }, JValue { l: uri_j }];
+        let ret = jni.call_static_int(c.class, c.share_log, &args);
+        jni.delete_local_ref(subject_j);
+        jni.delete_local_ref(uri_j);
+        ret == 0
+    }
+
+    /// Ask the Java side to post a dialog for an emulator that has stopped
+    /// making progress, with a button that shares the log.
+    ///
+    /// This is deliberately a *Java* dialog rather than an SDL message box:
+    /// the guest thread is stuck, so anything that has to run on it (including
+    /// the SDL event loop) is unavailable, while a dialog posted to the
+    /// activity's UI thread still appears.
+    ///
+    /// Returns false when the Java bridge is unavailable.
+    pub fn show_stall_dialog(message: &str, subject: &str, uri: &str) -> bool {
+        let Some(jni) = Jni::attach() else {
+            return false;
+        };
+        let Some(c) = cached() else {
+            return false;
+        };
+        if c.stall_dialog.is_null() {
+            return false;
+        }
+        let message_j = jni.new_jstring(message);
+        let subject_j = jni.new_jstring(subject);
+        let uri_j = jni.new_jstring(uri);
+        let args = [
+            JValue { l: message_j },
+            JValue { l: subject_j },
+            JValue { l: uri_j },
+        ];
+        let ret = jni.call_static_int(c.class, c.stall_dialog, &args);
+        jni.delete_local_ref(message_j);
+        jni.delete_local_ref(subject_j);
+        jni.delete_local_ref(uri_j);
+        ret == 0
+    }
 }
 
 #[cfg(not(target_os = "android"))]
@@ -727,6 +808,12 @@ mod imp {
         false
     }
     pub fn open_content_uri(_uri: &str) -> bool {
+        false
+    }
+    pub fn share_log_file(_subject: &str, _uri: &str) -> bool {
+        false
+    }
+    pub fn show_stall_dialog(_message: &str, _subject: &str, _uri: &str) -> bool {
         false
     }
 }

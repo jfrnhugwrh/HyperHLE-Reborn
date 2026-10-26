@@ -112,6 +112,17 @@ pub const APPS_DIR: &str = "touchHLE_apps";
 /// Name of the file intended for the user's own options.
 pub const USER_OPTIONS_FILE: &str = "touchHLE_options.txt";
 
+/// Name of the log file for the current run. See [crate::log].
+pub const LOG_FILE: &str = "touchHLE_log.txt";
+
+/// Name of the log file for the *previous* run.
+///
+/// The log is truncated when a run starts, but the most interesting failure
+/// (a hang, e.g. a game that stops drawing after its splash screen) is not a
+/// crash, so the user restarts the emulator to get back to the app picker.
+/// Keeping the previous run's file means the evidence survives that restart.
+pub const PREVIOUS_LOG_FILE: &str = "touchHLE_log_prev.txt";
+
 /// Persistent preferences for the graphical app picker.
 pub const PICKER_SETTINGS_FILE: &str = "touchHLE_picker_settings.txt";
 
@@ -203,7 +214,7 @@ fn android_documents_authority() -> String {
 /// `…/document/<document id>` form that `DocumentsContract` understands. The
 /// document id is a single path segment, so the slashes in it (the provider
 /// uses hierarchical ids like `root/<name>`) must be percent-encoded.
-fn android_document_uri(document_id: &str) -> String {
+pub(crate) fn android_document_uri(document_id: &str) -> String {
     format!(
         "content://{}/document/{}",
         android_documents_authority(),

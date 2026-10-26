@@ -2671,6 +2671,9 @@ impl Window {
     pub fn swap_window(&mut self) {
         self.window.gl_swap_window();
         self.perf_hints.frame_presented();
+        // Lets the stall watchdog tell "the app is stuck" apart from "the app
+        // is running but nothing reaches the screen" (see stall_watchdog).
+        crate::stall_watchdog::note_frame_presented();
 
         // FPS logging / UI: count frames and print once per second if enabled.
         if self.show_fps_counter.get() {
@@ -3126,6 +3129,13 @@ pub fn show_error_messagebox(window: Option<&Window>, error_message: &str) {
             button_id: 0,
             text: "Open touchHLE directory",
         },
+        // On Android the log lives in Android/data/…, which file managers are
+        // not allowed to browse, so the crash dialog offers to share it.
+        messagebox::ButtonData {
+            flags: messagebox::MessageBoxButtonFlag::NOTHING,
+            button_id: 2,
+            text: "Share log",
+        },
         messagebox::ButtonData {
             flags: messagebox::MessageBoxButtonFlag::NOTHING,
             button_id: 1,
@@ -3176,6 +3186,11 @@ pub fn show_error_messagebox(window: Option<&Window>, error_message: &str) {
                         }
                     }
                     Err(e) => echo!("Couldn't open file manager: {}", e),
+                },
+                // Share the log through the platform's share mechanism.
+                2 => match crate::log_share::share_log() {
+                    Ok(()) => echo!("Offered the log for sharing."),
+                    Err(e) => echo!("Couldn't share the log: {}", e),
                 },
                 // Close
                 1 => {}

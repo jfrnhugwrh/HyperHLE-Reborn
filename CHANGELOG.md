@@ -240,6 +240,8 @@ Usability:
 
 - Quick Options now has a “May fix graphics issues.” switch for `--force-composition`, including an explicit off state that overrides app-specific defaults. Switches are aligned beside their labels, and the scale-hack button text no longer gets clipped. (@j92580498-max)
 
+- A hang is now reportable. Previously the worst failure mode — a game that stops drawing after its splash screen and never recovers, leaving a black screen and nothing else — produced no crash report and no log line, and the log file (in `Android/data/…/files`, which modern Android hides from file managers) died with the restart needed to get back to the app picker. Now a small watchdog thread compares guest CPU progress against presented frames: if the guest thread stops advancing for 20 s it writes a stall report to the log naming the last guest PC/LR, the last 16 executed guest PCs, and the imported function the app was last seen entering (e.g. `_recv`, `_gethostbyname`), which is normally enough to identify what it is blocked on; if the CPU keeps running but no frame reaches the window for 30 s it says so instead, because that is a presentation problem rather than a stuck app. On Android the stall dialog offers “Share log”, which hands the file to the system share sheet through the app's own documents provider (no storage permission, no ADB); the crash dialog gained the same button, and the previous run's log is now kept as `touchHLE_log_prev.txt` so it survives a restart. Backgrounding the app does not count as a stall.
+
 ## v0.2.3 (2026-01-02)
 
 Compatibility:

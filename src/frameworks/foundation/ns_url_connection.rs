@@ -193,6 +193,11 @@ fn start_connection(env: &mut crate::Environment, connection: id) {
         return;
     }
 
+    // The `TOUCHHLE_FAKE_NETWORK_SUCCESS` debugging switch keeps precedence
+    // over the retired-endpoint interception in `url_loading`: it is an explicit
+    // opt-in that simulates a *successful* network for every request, so an
+    // app-specific fake JSON response must not be replaced by the default
+    // `--legacy-analytics=mock` 503.
     if fake_network_success_enabled() {
         let selector = env
             .objc
@@ -206,7 +211,11 @@ fn start_connection(env: &mut crate::Environment, connection: id) {
     }
 
     let request_data = url_loading::request_from_objc(env, request, nil, None);
-    let receiver = url_loading::send_async(request_data, env.options.network_access);
+    let receiver = url_loading::send_async(
+        request_data,
+        env.options.network_access,
+        env.options.legacy_analytics,
+    );
     env.objc
         .borrow_mut::<NSURLConnectionHostObject>(connection)
         .receiver = Some(receiver);
@@ -248,6 +257,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         url_loading::send(
             url_loading::request_from_objc(env, request, nil, None),
             env.options.network_access,
+            env.options.legacy_analytics,
         )
     };
     match result {

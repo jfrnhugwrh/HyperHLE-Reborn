@@ -17,6 +17,7 @@
 //!
 //! - Peter Steinberger's [Calling Super at Runtime in Swift](https://steipete.com/posts/calling-super-at-runtime/) explains `objc_msgSendSuper2`
 
+use super::dispatch_guard::{self, DispatchFrame, Verdict};
 use super::{id, nil, Class, ObjC, IMP, SEL};
 use crate::abi::{CallFromHost, GuestRet};
 use crate::mem::{ConstPtr, MutVoidPtr, Ptr, SafeRead};
@@ -310,79 +311,6 @@ fn objc_msgSend_inner(
             }
         }
     }
-    // Host-side recursion guard. If an Objective-C method (typically
-    // `hitTest:withEvent:` or `pointInside:withEvent:`) ends up recursing
-    // into itself indirectly, the host call stack balloons because every
-    // round trip goes host -> guest -> host. Without this guard that path
-    // SIGSEGVs the whole emulator once the native stack is exhausted.
-    //
-    // We use a thread-local counter instead of tracking it in
-    // `Environment`, since `objc_msgSend_inner` is the single chokepoint
-    // through which every dispatch (host or guest) must pass.
-    //
-    // 128 is a deliberate compromise: real iOS view hierarchies rarely go
-    // deeper than ~50 nested `nextResponder`/`hitTest:` levels, and a small
-    // limit keeps us well clear of Android's 1 MB default thread stack
-    // (each `objc_msgSend_inner` host frame is several KB once Rust adds
-    // local variables, log!() temporaries, and the dispatch trampoline).
-    const MAX_DEPTH: usize = 128;
-    thread_local! {
-        static DISPATCH_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    }
-    let depth = DISPATCH_DEPTH.with(|d| {
-        let new = d.get() + 1;
-        d.set(new);
-        new
-    });
-    struct DepthGuard;
-    impl Drop for DepthGuard {
-        fn drop(&mut self) {
-            DISPATCH_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
-        }
-    }
-    let _guard = DepthGuard;
-    if depth > MAX_DEPTH {
-        let sel_name = selector.as_str(&env.mem).to_string();
-
-        if env.bundle.bundle_identifier() == "com.tayasui.mrpoofree"
-            && (sel_name.contains("repaint")
-                || sel_name.contains("draw")
-                || sel_name.contains("displayLink")
-                || sel_name.contains("startAnimation")
-                || sel_name.contains("stopAnimation")
-                || sel_name.contains("startRendering")
-                || sel_name.contains("stopRendering")
-                || sel_name.contains("presentRenderbuffer")
-                || sel_name.contains("applicationDidBecomeActive")
-                || sel_name.contains("setAnimationFrameInterval"))
-        {
-            log!(
-                "[MR GOO MSG TRACE] receiver={:?} selector={}",
-                receiver,
-                sel_name
-            );
-        }
-        log!(
-            "Warning: objc_msgSend recursion limit ({}) exceeded while dispatching \"{}\" to {:?}; bailing out with a nil return.",
-            MAX_DEPTH,
-            sel_name,
-            receiver,
-        );
-        // Special handling for allocWithZone: — if recursion is hit during
-        // allocation, perform the allocation directly using NSObject's
-        // fallback path rather than returning nil (which causes cascading
-        // failures like "texture cannot be nil!" in games).
-        if sel_name == "allocWithZone:" {
-            let obj =
-                env.objc
-                    .alloc_object(receiver, Box::new(super::TrivialHostObject), &mut env.mem);
-            env.cpu.regs_mut()[0] = obj.to_bits();
-            return;
-        }
-        env.cpu.regs_mut()[0..2].fill(0);
-        return;
-    }
-
     let message_type_info = env.objc.message_type_info.take();
 
     if receiver == nil {
@@ -392,37 +320,39 @@ fn objc_msgSend_inner(
         return;
     }
 
-    let orig_class = super2.unwrap_or_else(|| ObjC::read_isa(receiver, &env.mem));
-    // Graceful exit if isa is nil — this typically means the object was
-    // already deallocated (use-after-free in guest code) or was never
-    // properly allocated. Per Apple's Objective-C runtime behavior,
-    // messaging a deallocated object is undefined behavior, but we handle
-    // it gracefully by returning nil/0 instead of crashing.
-    if orig_class == nil {
-        // Rate-limit these warnings to avoid flooding the log when the
-        // guest app has a use-after-free bug that triggers repeatedly.
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static NIL_ISA_COUNT: AtomicUsize = AtomicUsize::new(0);
-        const NIL_ISA_LOG_LIMIT: usize = 8;
-        let count = NIL_ISA_COUNT.fetch_add(1, Ordering::Relaxed);
-        if count < NIL_ISA_LOG_LIMIT {
-            log!(
-                "Warning: receiver {:?} has nil isa! Ignoring message \"{}\". \
-                 (This usually means the object was already freed — use-after-free \
-                 in guest code.) [{}/{}]",
-                receiver,
-                selector.as_str(&env.mem),
-                count + 1,
-                NIL_ISA_LOG_LIMIT,
-            );
-        } else if count == NIL_ISA_LOG_LIMIT {
-            log!(
-                "Warning: suppressing further nil-isa warnings ({} already logged). \
-                 The guest app has use-after-free bugs.",
-                NIL_ISA_LOG_LIMIT,
-            );
+    // Establish the receiver's class before anything else looks at it. A `nil`
+    // `isa` is an object-lifetime problem, not a recursion problem, and the
+    // guard's recovery paths (`-release`, `-class`, …) need a valid class; the
+    // old code checked the recursion limit first, so a `release` sent to a
+    // dangling pointer was reported as "recursion limit exceeded" instead of
+    // the use-after-free it actually was.
+    let orig_class = match super2 {
+        Some(class) => class,
+        None => match resolve_receiver_class(env, receiver, selector) {
+            Some(class) => class,
+            None => {
+                env.cpu.regs_mut()[0..2].fill(0);
+                return;
+            }
+        },
+    };
+
+    // Re-entrancy guard. See `super::dispatch_guard` for why this tracks the
+    // whole dispatch chain (so it can name the pair that actually cycled)
+    // instead of stopping dead at a fixed depth.
+    let (frame, verdict) = DispatchFrame::enter(receiver.to_bits(), selector.to_bits());
+    let _frame = frame;
+    if verdict != Verdict::Ok {
+        report_dispatch_guard_event(env, receiver, selector, verdict);
+    }
+    if matches!(verdict, Verdict::Cycle { .. } | Verdict::TooDeep) {
+        // The message must not run. Finish the part of it that is a runtime
+        // operation (`-retain`, `-release`, `-class`, allocation, …) so that
+        // ownership stays balanced and the guest sees a sane return value,
+        // instead of the blanket `nil` the old hard cut-off produced.
+        if !complete_aborted_message(env, receiver, selector) {
+            env.cpu.regs_mut()[0..2].fill(0);
         }
-        env.cpu.regs_mut()[0..2].fill(0);
         return;
     }
 
@@ -631,18 +561,25 @@ fn objc_msgSend_inner(
     let mut class = orig_class;
     loop {
         if class == nil {
-            assert!(class != orig_class);
-            let (class_name_for_log, is_metaclass) = {
-                let class_host_object = env.objc.get_host_object(orig_class).unwrap();
-                let class_host_object = class_host_object
-                    .as_any()
-                    .downcast_ref::<super::ClassHostObject>()
-                    .unwrap();
-                (
-                    class_host_object.name.clone(),
-                    class_host_object.is_metaclass,
-                )
-            };
+            // The chain ran off the top of the hierarchy. If the receiver's
+            // own class is unknown (`orig_class == nil`, reachable through a
+            // `super` call from a class whose `superclass` is `nil`), there is
+            // no host object to name: answer as if the message had been sent
+            // to nil instead of asserting.
+            if orig_class == nil {
+                log_dbg!(
+                    "Dispatching \"{}\" with no class to search (receiver {:?}); returning 0.",
+                    selector.as_str(&env.mem),
+                    receiver,
+                );
+                env.cpu.regs_mut()[0..2].fill(0);
+                return;
+            }
+            let (class_name_for_log, is_metaclass) = env
+                .objc
+                .class_like_metadata(orig_class)
+                .map(|(name, is_metaclass)| (name.to_owned(), is_metaclass))
+                .unwrap_or_else(|| ("<unknown>".to_string(), false));
 
             // `+[Class self]` must return the class itself. The real objc
             // runtime resolves `self` via the metaclass root NSObject chain,
@@ -1011,13 +948,29 @@ Type mismatch when sending message {} to {:?}!
                 env.cpu.regs_mut()[0..2].fill(0);
                 return;
             }
-            log!(
-                "Class \"{}\" ({:?}) is unimplemented. Call to {} method \"{}\".",
-                class_name_for_log,
-                class,
-                if is_metaclass { "class" } else { "instance" },
-                sel_name,
-            );
+            // Report each `(class, selector)` pair once. This used to log on
+            // every message, and SDKs poll unimplemented probes on every frame
+            // or on every retry of a start-up loop, which buried the rest of
+            // the launch log under thousands of identical lines — the very
+            // output a bug report needs to see. The dispatch chain is included
+            // so the call site is identifiable from a single line.
+            if first_report(
+                "unimplemented-class",
+                (class.to_bits(), selector.to_bits()),
+                NIL_ISA_REPORTS,
+            ) {
+                log!(
+                    "Class \"{}\" ({:?}) is unimplemented. Call to {} method \"{}\" \
+                     (thread {}; further calls of this selector on this class are not \
+                     logged). Chain: {}",
+                    class_name_for_log,
+                    class,
+                    if is_metaclass { "class" } else { "instance" },
+                    sel_name,
+                    env.current_thread,
+                    format_dispatch_chain(env),
+                );
+            }
             env.cpu.regs_mut()[0..2].fill(0);
             return;
         } else if let Some((class_name_for_log, is_metaclass)) = host_object
@@ -1045,25 +998,41 @@ Type mismatch when sending message {} to {:?}!
             if let Some(result) =
                 fake_class_message_result(&class_name_for_log, is_metaclass, &sel_name)
             {
-                log!(
-                    "Call to faked class \"{}\" ({:?}) {} method \"{}\". Returning {}.",
-                    class_name_for_log,
-                    class,
-                    if is_metaclass { "class" } else { "instance" },
-                    sel_name,
-                    result,
-                );
+                if first_report(
+                    "faked-class",
+                    (class.to_bits(), selector.to_bits()),
+                    NIL_ISA_REPORTS,
+                ) {
+                    log!(
+                        "Call to faked class \"{}\" ({:?}) {} method \"{}\". Returning {}.",
+                        class_name_for_log,
+                        class,
+                        if is_metaclass { "class" } else { "instance" },
+                        sel_name,
+                        result,
+                    );
+                }
                 env.cpu.regs_mut()[0] = result;
                 env.cpu.regs_mut()[1] = 0;
                 return;
             }
-            log!(
-                "Call to faked class \"{}\" ({:?}) {} method \"{}\". Behaving as if message was sent to nil.",
-                class_name_for_log,
-                class,
-                if is_metaclass { "class" } else { "instance" },
-                sel_name,
-            );
+            // Once per `(class, selector)` pair: an old ad SDK retrying its
+            // start-up probe used to fill the log with the same line forever.
+            if first_report(
+                "faked-class",
+                (class.to_bits(), selector.to_bits()),
+                NIL_ISA_REPORTS,
+            ) {
+                log!(
+                    "Call to faked class \"{}\" ({:?}) {} method \"{}\". Behaving as if \
+                     message was sent to nil (further calls of this selector on this class \
+                     are not logged).",
+                    class_name_for_log,
+                    class,
+                    if is_metaclass { "class" } else { "instance" },
+                    sel_name,
+                );
+            }
             env.cpu.regs_mut()[0..2].fill(0);
             return;
         } else {
@@ -2903,6 +2872,423 @@ pub fn autorelease(env: &mut Environment, object: id) -> id {
     msg![env; object autorelease]
 }
 
+// MARK: - Dispatch diagnostics and dispatch-guard recovery
+
+/// Maximum number of distinct `(receiver, selector)` pairs that produce each
+/// class of diagnostic. Keeps a pathological app from filling the log (and the
+/// process memory) with millions of unique warnings while still reporting the
+/// first occurrences, which is what a bug report needs.
+const CYCLE_REPORTS: usize = 64;
+const DEEP_REPORTS: usize = 32;
+const NIL_ISA_REPORTS: usize = 64;
+
+/// Returns `true` the first time it is called for `(category, key)`, up to
+/// `limit` distinct keys per category.
+///
+/// One category per diagnostic kind keeps a chatty kind (deep chains, say) from
+/// using up the budget of a rare and more important one (use-after-free).
+fn first_report(category: &'static str, key: (u32, u32), limit: usize) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Keys already reported, plus a per-category count.
+    ///
+    /// The count is kept separately so that the budget check is O(1): this
+    /// function is called for every message on the diagnostic paths (e.g. an
+    /// unimplemented class polled every frame), where scanning the whole key
+    /// set would turn a bounded log into per-message work.
+    struct Reported {
+        keys: std::collections::HashSet<(&'static str, u32, u32)>,
+        per_category: HashMap<&'static str, usize>,
+    }
+
+    static SEEN: OnceLock<Mutex<Reported>> = OnceLock::new();
+    let mut seen = SEEN
+        .get_or_init(|| {
+            Mutex::new(Reported {
+                keys: std::collections::HashSet::new(),
+                per_category: HashMap::new(),
+            })
+        })
+        .lock()
+        .unwrap();
+    if seen.per_category.get(category).copied().unwrap_or(0) >= limit {
+        return false;
+    }
+    if !seen.keys.insert((category, key.0, key.1)) {
+        return false;
+    }
+    *seen.per_category.entry(category).or_insert(0) += 1;
+    true
+}
+
+/// Render the innermost active dispatches as `[Class selector] <- …`.
+///
+/// This is the single most useful piece of information for both a runaway
+/// dispatch and a use-after-free, because it names the guest code path (in
+/// class/selector terms) instead of only the object address.
+fn format_dispatch_chain(env: &crate::Environment) -> String {
+    let frames = super::dispatch_guard::snapshot(super::dispatch_guard::CHAIN_DUMP_LEN);
+    if frames.is_empty() {
+        return "<empty>".to_string();
+    }
+    let mut out = String::new();
+    for frame in frames {
+        if !out.is_empty() {
+            out.push_str(" <- ");
+        }
+        let receiver = id::from_bits(frame.receiver);
+        // Diagnostics run on the failure path, often *because* a receiver is
+        // corrupt, so this must never use the panicking `read_isa`: naming the
+        // class is best-effort, naming the fault is mandatory.
+        let class_name = ObjC::try_read_isa(receiver, &env.mem)
+            .and_then(|class| env.objc.try_get_class_name(class))
+            .unwrap_or("<unknown-class>");
+        let selector = SEL::from_bits(frame.selector);
+        out.push_str(&format!(
+            "[{} {}]",
+            class_name,
+            selector.as_str(&env.mem)
+        ));
+    }
+    out
+}
+
+/// Log where the corruption was observed, on both sides of the emulator.
+///
+/// A warning such as "receiver has a nil isa" is only actionable if it says
+/// *which guest code* did it. The register snapshot gives that: `PC` is the
+/// instruction after the `objc_msgSend` call site and `LR` the return address
+/// of the sending function, so they can be matched against the app binary. The
+/// host backtrace then says which emulator subsystem (GLES bridge, Core
+/// Animation commit, audio callback, run loop, …) was running at the time,
+/// which is impossible to recover from guest state alone.
+///
+/// Capturing a backtrace is expensive, so by default only the first few events
+/// are reported; set `TOUCHHLE_TRACE_OBJC_BACKTRACE` to log all of them.
+fn log_host_backtrace(env: &crate::Environment, context: &str) {
+    use crate::cpu::Cpu;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static CAPTURED: AtomicUsize = AtomicUsize::new(0);
+    let always = crate::env_flag_cached!("TOUCHHLE_TRACE_OBJC_BACKTRACE");
+    let with_backtrace = always || CAPTURED.fetch_add(1, Ordering::Relaxed) < 3;
+    let regs = env.cpu.regs();
+    let guest_context = format!(
+        "guest PC={:#010x} LR={:#010x} SP={:#010x} R0={:#010x} R1={:#010x} (thread {})",
+        regs[Cpu::PC],
+        regs[Cpu::LR],
+        regs[Cpu::SP],
+        regs[0],
+        regs[1],
+        env.current_thread,
+    );
+    if with_backtrace {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        log!("objc-runtime: {context}: {guest_context}\nhost backtrace:\n{backtrace}");
+    } else {
+        log!("objc-runtime: {context}: {guest_context}");
+    }
+}
+
+/// Report a dispatch that the re-entrancy guard flagged.
+fn report_dispatch_guard_event(
+    env: &mut Environment,
+    receiver: id,
+    selector: SEL,
+    verdict: Verdict,
+) {
+    if verdict == Verdict::Ok {
+        return;
+    }
+    // A deep-but-valid chain reaches this function on *every* frame past
+    // `WARN_DEPTH`, so nothing here may allocate or format unless the message
+    // will actually be printed. `first_report` is keyed on raw bits, so the
+    // selector name is only materialised inside a reporting branch.
+    match verdict {
+        Verdict::Ok => {}
+        Verdict::Deep => {
+            if first_report("deep-dispatch", (receiver.to_bits(), selector.to_bits()), DEEP_REPORTS) {
+                let selector_name = selector.as_str(&env.mem).to_owned();
+                log!(
+                    "Note: Objective-C dispatch chain is {} frames deep while dispatching \
+                     \"{}\" to {:?} (thread {}). The chain is deep but not cyclic, so \
+                     dispatch continues. Chain: {}",
+                    dispatch_guard::depth(),
+                    selector_name,
+                    receiver,
+                    env.current_thread,
+                    format_dispatch_chain(env),
+                );
+            }
+        }
+        Verdict::Cycle { occurrences } => {
+            if first_report("dispatch-cycle", (receiver.to_bits(), selector.to_bits()), CYCLE_REPORTS) {
+                let selector_name = selector.as_str(&env.mem).to_owned();
+                log!(
+                    "Warning: objc_msgSend cycle detected: \"{}\" sent to {:?} re-entered \
+                     its own dispatch ({} active occurrences, thread {}). Breaking the \
+                     cycle at this frame instead of recursing until the host stack dies. \
+                     Chain: {}",
+                    selector_name,
+                    receiver,
+                    occurrences,
+                    env.current_thread,
+                    format_dispatch_chain(env),
+                );
+                // Preserved per-app diagnostic from the old depth-limit path.
+                if env.bundle.bundle_identifier() == "com.tayasui.mrpoofree"
+                    && (selector_name.contains("repaint")
+                        || selector_name.contains("draw")
+                        || selector_name.contains("displayLink")
+                        || selector_name.contains("startAnimation")
+                        || selector_name.contains("stopAnimation")
+                        || selector_name.contains("startRendering")
+                        || selector_name.contains("stopRendering")
+                        || selector_name.contains("presentRenderbuffer")
+                        || selector_name.contains("applicationDidBecomeActive")
+                        || selector_name.contains("setAnimationFrameInterval"))
+                {
+                    log!(
+                        "[MR GOO MSG TRACE] receiver={:?} selector={}",
+                        receiver,
+                        selector_name
+                    );
+                }
+                log_host_backtrace(env, "dispatch-cycle");
+            }
+        }
+        Verdict::TooDeep => {
+            if first_report("dispatch-cycle", (receiver.to_bits(), selector.to_bits()), CYCLE_REPORTS) {
+                let selector_name = selector.as_str(&env.mem).to_owned();
+                log!(
+                    "Warning: objc_msgSend depth limit ({}) reached while dispatching \"{}\" \
+                     to {:?} (thread {}); no repeated pair was found, so this is a very deep \
+                     (or infinitely growing) call chain. Aborting the dispatch. Chain: {}",
+                    super::dispatch_guard::MAX_DEPTH,
+                    selector_name,
+                    receiver,
+                    env.current_thread,
+                    format_dispatch_chain(env),
+                );
+                log_host_backtrace(env, "dispatch-depth-limit");
+            }
+        }
+    }
+}
+
+/// Complete as much of a refused dispatch as the runtime can do itself.
+///
+/// Only messages whose implementation is (part of) the Objective-C runtime
+/// contract are handled here: reference counting, allocation, and the two
+/// identity selectors. Everything else returns `false` and the caller answers
+/// the message with a zero/nil return, which is the least-surprising outcome
+/// for guest code that is stuck in a cycle.
+///
+/// Keeping `-retain`/`-release` working matters for object lifetimes: the old
+/// "return nil on deep recursion" behaviour dropped the refcount update of a
+/// `-release`, so the object could never be freed (a leak), while dropping the
+/// `-retain` of a returned object could lead to an early `-dealloc` (a
+/// use-after-free).
+fn complete_aborted_message(env: &mut Environment, receiver: id, selector: SEL) -> bool {
+    let selector_name = selector.as_str(&env.mem).to_owned();
+    match selector_name.as_str() {
+        // `+alloc`/`+allocWithZone:` are runtime operations, not guest code:
+        // allocating directly keeps the many "texture cannot be nil" style
+        // failures away when a class's `+alloc` re-enters itself.
+        "alloc" | "allocWithZone:" => {
+            let object = env.objc.alloc_object(
+                receiver,
+                Box::new(super::TrivialHostObject),
+                &mut env.mem,
+            );
+            env.cpu.regs_mut()[0] = object.to_bits();
+            env.cpu.regs_mut()[1] = 0;
+            true
+        }
+        "retain" => {
+            env.objc.increment_refcount(receiver);
+            env.cpu.regs_mut()[0] = receiver.to_bits();
+            env.cpu.regs_mut()[1] = 0;
+            true
+        }
+        "release" => {
+            // `-[NSObject release]` is "decrement, then send -dealloc if the
+            // count reached zero". `-dealloc` is a *different* selector, so it
+            // is not itself part of the cycle and can still be dispatched.
+            let dealloc_selector = match env.objc.lookup_selector("dealloc") {
+                Some(selector) => selector,
+                None => env
+                    .objc
+                    .register_host_selector("dealloc".to_string(), &mut env.mem),
+            };
+            if env.objc.decrement_refcount(receiver) {
+                log_dbg!(
+                    "Note: completing -release for {:?} at a cyclic dispatch; sending -dealloc.",
+                    receiver
+                );
+                let _: () = msg_send_no_type_checking(env, (receiver, dealloc_selector));
+            }
+            env.cpu.regs_mut()[0..2].fill(0);
+            true
+        }
+        "autorelease" => {
+            // `-autorelease` must return the receiver (never nil); enqueueing it
+            // in a pool would require re-entering the pool's own dispatch,
+            // which is exactly what we must not do here. The pool will still
+            // release anything else it owns.
+            env.cpu.regs_mut()[0] = receiver.to_bits();
+            env.cpu.regs_mut()[1] = 0;
+            true
+        }
+        "class" => {
+            // `-[NSObject class]` is "return the isa"; answering it locally is
+            // always correct and breaks the `-class` → `-isKindOfClass:` →
+            // `-class` style loops seen during start-up.
+            let class = env
+                .objc
+                .registered_isa(receiver)
+                .unwrap_or_else(|| ObjC::read_isa(receiver, &env.mem));
+            env.cpu.regs_mut()[0] = class.to_bits();
+            env.cpu.regs_mut()[1] = 0;
+            true
+        }
+        "self" => {
+            env.cpu.regs_mut()[0] = receiver.to_bits();
+            env.cpu.regs_mut()[1] = 0;
+            true
+        }
+        "dealloc" => {
+            // A guest `-dealloc` that re-entered itself cannot finish; complete
+            // the teardown at the runtime level so the object does not leak,
+            // and log it because any guest-level cleanup in the rest of that
+            // `-dealloc` is being skipped.
+            log!(
+                "Warning: -dealloc for {:?} re-entered itself; finishing the teardown at \
+                 the runtime level (guest `-dealloc` cleanup after this point is skipped). \
+                 Thread {}. Chain: {}",
+                receiver,
+                env.current_thread,
+                format_dispatch_chain(env),
+            );
+            env.objc.dealloc_object(receiver, &mut env.mem);
+            env.cpu.regs_mut()[0..2].fill(0);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Read the receiver's class, dealing with a `nil` `isa` along the way.
+///
+/// Returns `None` when the receiver cannot be used, after explaining why. The
+/// analysis and the repair live in [super::objects] so that the runtime keeps a
+/// single, consistent view of object lifetimes:
+///
+/// * a *clobbered* `isa` on an object the runtime still owns is repaired (the
+///   authoritative class is known host-side), so the message is dispatched
+///   normally instead of being lost;
+/// * a *deallocated* object is reported as the use-after-free it is, naming the
+///   class it used to have;
+/// * anything else is reported as an invalid pointer.
+///
+/// Either way the caller returns a zero result, which is what the runtime does
+/// for messages to dead objects, instead of letting a corrupted `isa` cascade
+/// into arbitrary host code.
+fn resolve_receiver_class(env: &mut Environment, receiver: id, selector: SEL) -> Option<Class> {
+    use super::objects::NilIsaDiagnosis;
+
+    // This runs for every non-`super` message, so the healthy path must not
+    // allocate: the selector name is materialised only when a diagnostic is
+    // actually printed (there is no `first_report` hit on the common path).
+    match ObjC::try_read_isa(receiver, &env.mem) {
+        Some(isa) if isa != nil => return Some(isa),
+        Some(_) => {}
+        None => {
+            // Not readable guest memory at all: a wild pointer. Report it
+            // rather than letting `Mem::read` panic the emulator.
+            if first_report(
+                "wild-receiver",
+                (receiver.to_bits(), selector.to_bits()),
+                NIL_ISA_REPORTS,
+            ) {
+                let selector_name = selector.as_str(&env.mem).to_owned();
+                log!(
+                    "Warning: message \"{}\" to {:?}, which does not address readable guest \
+                     memory (thread {}). Ignoring the message; the receiver pointer is \
+                     corrupt. Dispatch chain: {}",
+                    selector_name,
+                    receiver,
+                    env.current_thread,
+                    format_dispatch_chain(env),
+                );
+                log_host_backtrace(env, "wild-receiver");
+            }
+            return None;
+        }
+    }
+
+    match env.objc.diagnose_nil_isa(receiver) {
+        NilIsaDiagnosis::Clobbered { class } => {
+            env.objc.repair_isa(receiver, &mut env.mem);
+            if first_report("isa-repair", (receiver.to_bits(), 0), NIL_ISA_REPORTS) {
+                let selector_name = selector.as_str(&env.mem).to_owned();
+                log!(
+                    "Warning: receiver {:?} had a nil isa but the runtime still owns it as \
+                     a \"{}\"; the isa pointer was clobbered by guest code (buffer overrun \
+                     into an object header, or an explicit write). Restored it so \"{}\" \
+                     (thread {}) can be dispatched.",
+                    receiver,
+                    env.objc.get_class_name(class),
+                    selector_name,
+                    env.current_thread,
+                );
+                log_host_backtrace(env, "isa-repair");
+            }
+            Some(class)
+        }
+        NilIsaDiagnosis::Freed { class, class_name } => {
+            if first_report(
+                "use-after-free",
+                (receiver.to_bits(), selector.to_bits()),
+                NIL_ISA_REPORTS,
+            ) {
+                let selector_name = selector.as_str(&env.mem).to_owned();
+                log!(
+                    "Warning: use-after-free: message \"{}\" to {:?}, which was already \
+                     deallocated (class \"{}\", class object {:?}, thread {}). Ignoring the \
+                     message. Dispatch chain: {}",
+                    selector_name,
+                    receiver,
+                    class_name.as_deref().unwrap_or("<unknown>"),
+                    class,
+                    env.current_thread,
+                    format_dispatch_chain(env),
+                );
+                log_host_backtrace(env, "use-after-free");
+            }
+            None
+        }
+        NilIsaDiagnosis::Unknown => {
+            if first_report("nil-isa", (receiver.to_bits(), selector.to_bits()), NIL_ISA_REPORTS) {
+                let selector_name = selector.as_str(&env.mem).to_owned();
+                log!(
+                    "Warning: message \"{}\" to {:?}, which has a nil isa and is not known \
+                     to the runtime: it is neither live nor an object this runtime \
+                     deallocated, so the pointer is corrupt or was never an object. \
+                     Thread {}. Dispatch chain: {}",
+                    selector_name,
+                    receiver,
+                    env.current_thread,
+                    format_dispatch_chain(env),
+                );
+                log_host_backtrace(env, "nil-isa-unknown");
+            }
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod fake_class_tests {
     use super::fake_class_message_result;
@@ -2927,5 +3313,22 @@ mod fake_class_tests {
             fake_class_message_result("FlurryAPI", true, "hasUserSetFeintAccess"),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod dispatch_diagnostic_tests {
+    use super::first_report;
+
+    #[test]
+    fn report_budget_is_per_category_and_per_key() {
+        // A diagnostic must be printed once per affected object/selector, and a
+        // chatty category must not use up another category's budget (that is
+        // how "deep dispatch" notes used to silence use-after-free reports).
+        assert!(first_report("test-category-a", (1, 2), 2));
+        assert!(!first_report("test-category-a", (1, 2), 2));
+        assert!(first_report("test-category-a", (3, 4), 2));
+        assert!(!first_report("test-category-a", (5, 6), 2));
+        assert!(first_report("test-category-b", (5, 6), 2));
     }
 }

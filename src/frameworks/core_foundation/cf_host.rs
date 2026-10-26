@@ -57,7 +57,8 @@ use crate::libc::sys::socket::sockaddr;
 use crate::mem::{ConstVoidPtr, GuestISize, MutPtr, MutVoidPtr, Ptr, SafeRead};
 use crate::objc::{nil, objc_classes, release, Class, ClassExports, HostObject};
 use crate::Environment;
-use std::net::{SocketAddr, SocketAddrV4, ToSocketAddrs};
+use crate::libc::dns_lookup;
+use std::net::SocketAddrV4;
 
 pub type CFHostRef = CFTypeRef;
 
@@ -141,6 +142,16 @@ pub struct CFHostHostObject {
     pub client_release: Option<GuestFunction>,
     /// Run loops the host has been scheduled on.
     scheduled: Vec<ScheduleEntry>,
+    /// Failure reported by the last resolution of each info type, replayed to
+    /// the client callout.
+    ///
+    /// CFHost's callback signature carries `const CFStreamError *error`, and
+    /// `NULL` means "success". The previous implementation always passed
+    /// `NULL`, so a client that (correctly) keyed its start-up path off the
+    /// error pointer believed a failed lookup had succeeded — and, because the
+    /// address array was empty, could re-request resolution forever. Keeping
+    /// the real error makes the failure observable and terminal, as on iOS.
+    last_error: [Option<CFStreamError>; INFO_TYPE_COUNT],
 }
 
 impl HostObject for CFHostHostObject {}
@@ -204,6 +215,7 @@ fn alloc_cfhost(
             client_retain: None,
             client_release: None,
             scheduled: Vec::new(),
+            last_error: [None; INFO_TYPE_COUNT],
         }),
         &mut env.mem,
     )
@@ -303,21 +315,38 @@ fn CFHostCreateCopy(
 
 // MARK: - Resolution
 
-fn perform_dns_lookup(name: &str) -> std::io::Result<Vec<SocketAddrV4>> {
-    // Port 0 is a placeholder; only the addresses matter.
-    let lookup_str = format!("{}:0", name);
-    let addrs = lookup_str.to_socket_addrs()?;
-    // IPv6 is not currently exposed to the guest (sockaddr is 16 bytes,
-    // IPv4-only), so drop V6 results.
-    Ok(addrs
-        .filter_map(|addr| match addr {
-            SocketAddr::V4(v4) => Some(v4),
-            SocketAddr::V6(_) => None,
-        })
-        .collect())
+/// Map a resolver failure onto the `CFStreamError` CFHost clients expect.
+///
+/// `CFStreamError.domain`/`.error` use the CFStreamErrorDomain* vocabulary. For
+/// DNS-level failures Apple reports `kCFStreamErrorDomainNetDB` with an
+/// `h_errno`-style code, and for "the resolver gave up" a POSIX `ETIMEDOUT`.
+/// We keep that split: it is what SDKs branch on to distinguish "we are offline"
+/// from "that host does not exist".
+fn stream_error_for(error: dns_lookup::LookupError) -> CFStreamError {
+    match error {
+        // The service is gone: same observable result as a name that does not
+        // exist (h_errno NO_DATA/HOST_NOT_FOUND territory).
+        dns_lookup::LookupError::DefunctService => CFStreamError {
+            domain: kCFStreamErrorDomainNetDB,
+            error: h_errno_host_not_found(),
+        },
+        dns_lookup::LookupError::TimedOut => CFStreamError {
+            domain: kCFStreamErrorDomainPOSIX,
+            error: libc_ETIMEDOUT(),
+        },
+        dns_lookup::LookupError::Failed => CFStreamError {
+            domain: kCFStreamErrorDomainNetDB,
+            error: h_errno_try_again(),
+        },
+    }
 }
 
-fn fire_callout(env: &mut Environment, host: CFHostRef, info: CFHostInfoType) {
+fn fire_callout(
+    env: &mut Environment,
+    host: CFHostRef,
+    info: CFHostInfoType,
+    error: Option<CFStreamError>,
+) {
     let (callout, client_info) = {
         let h = env.objc.borrow::<CFHostHostObject>(host);
         (h.callout, h.client_info)
@@ -329,15 +358,34 @@ fn fire_callout(env: &mut Environment, host: CFHostRef, info: CFHostInfoType) {
     //   void (*CFHostClientCallBack)(CFHostRef, CFHostInfoType,
     //                                const CFStreamError*, void* info);
     // NULL CFStreamError* indicates success.
-    let error_ptr: MutPtr<CFStreamError> = Ptr::null();
+    //
+    // The error value has to live in guest-addressable memory for the duration
+    // of the callout, so it is copied into a temporary allocation that is freed
+    // as soon as the callout returns.
+    let (error_ptr, error_allocation): (MutPtr<CFStreamError>, Option<MutPtr<CFStreamError>>) =
+        match error {
+            Some(error) => {
+                let allocation = env
+                    .mem
+                    .alloc(std::mem::size_of::<CFStreamError>() as u32)
+                    .cast::<CFStreamError>();
+                env.mem.write(allocation, error);
+                (allocation, Some(allocation))
+            }
+            None => (Ptr::null(), None),
+        };
     log_dbg!(
-        "CFHost: firing client callout {:?} host={:?} info={} client_info={:?}",
+        "CFHost: firing client callout {:?} host={:?} info={} error={:?} client_info={:?}",
         cb,
         host,
         info,
+        error,
         client_info,
     );
     let _: () = cb.call_from_host(env, (host, info, error_ptr, client_info));
+    if let Some(allocation) = error_allocation {
+        env.mem.free(allocation.cast());
+    }
 }
 
 fn CFHostStartInfoResolution(
@@ -400,21 +448,36 @@ fn CFHostStartInfoResolution(
                 "Warning: CFHostStartInfoResolution: unsupported info type {}; returning false.",
                 other
             );
-            env.objc.borrow_mut::<CFHostHostObject>(host).in_progress[info_idx] = false;
+            let stream_error = CFStreamError {
+                domain: kCFStreamErrorDomainPOSIX,
+                error: libc_EINVAL(),
+            };
+            {
+                let mut h = env.objc.borrow_mut::<CFHostHostObject>(host);
+                h.in_progress[info_idx] = false;
+                h.last_error[info_idx] = Some(stream_error);
+            }
+            write_stream_error(env, error, stream_error);
             false
         }
     };
 
-    env.objc.borrow_mut::<CFHostHostObject>(host).in_progress[info_idx] = false;
+    // Remember the failure (if any) so the callout below can replay it. The
+    // per-resolution error has to survive until the callout runs, and the
+    // callout is invoked after `start_*` has returned.
+    let recorded_error = env.objc.borrow::<CFHostHostObject>(host).last_error[info_idx];
+    {
+        let mut h = env.objc.borrow_mut::<CFHostHostObject>(host);
+        h.in_progress[info_idx] = false;
+    }
 
     // Notify the client if one was set and the resolution wasn't cancelled.
     // Apple fires the callout on both success and failure; on failure the
-    // callout receives a non-NULL CFStreamError*, but we don't preserve the
-    // per-resolution error across the async boundary in this minimal port,
-    // so we just pass NULL and rely on the caller checking CFHostGetAddressing.
+    // callout receives a non-NULL CFStreamError*.
     let cancelled = env.objc.borrow::<CFHostHostObject>(host).cancelled[info_idx];
     if !cancelled {
-        fire_callout(env, host, info);
+        let callout_error = if result { None } else { recorded_error };
+        fire_callout(env, host, info, callout_error);
     }
     result
 }
@@ -446,32 +509,61 @@ fn start_addresses(env: &mut Environment, host: CFHostRef, error: MutPtr<CFStrea
         return false;
     };
 
+    // `--allow-network-access` governs every other networking entry point
+    // (getaddrinfo, NSURLConnection, …); CFHost used to ignore it and always
+    // perform a real lookup. Besides being inconsistent, that meant an app with
+    // networking disabled could still block the emulator on DNS — the exact
+    // start-up freeze this module is meant to prevent. Fail immediately with
+    // the same "host not found" answer a device without connectivity produces.
+    if !env.options.network_access {
+        let stream_error = CFStreamError {
+            domain: kCFStreamErrorDomainNetDB,
+            error: h_errno_host_not_found(),
+        };
+        write_stream_error(env, error, stream_error);
+        env.objc.borrow_mut::<CFHostHostObject>(host).last_error[kCFHostAddresses as usize] =
+            Some(stream_error);
+        log!(
+            "CFHost: not resolving {:?} because network access is disabled \
+             (--allow-network-access); reporting host-not-found.",
+            name_str,
+        );
+        return false;
+    }
+
     log_dbg!(
         "CFHostStartInfoResolution(addresses): resolving {:?}",
         name_str
     );
-    match perform_dns_lookup(&name_str) {
+    match dns_lookup::resolve_ipv4_addresses(&name_str) {
         Ok(resolved) => {
             log!(
                 "CFHost: {:?} resolved to {} address(es)",
                 name_str,
                 resolved.len(),
             );
-            let h = env.objc.borrow_mut::<CFHostHostObject>(host);
+            let mut h = env.objc.borrow_mut::<CFHostHostObject>(host);
             h.resolved_addresses = resolved;
             h.resolved[kCFHostAddresses as usize] = true;
+            h.last_error[kCFHostAddresses as usize] = None;
             true
         }
-        Err(e) => {
-            log!("CFHost: DNS lookup for {:?} failed: {}", name_str, e);
-            write_stream_error(
-                env,
-                error,
-                CFStreamError {
-                    domain: kCFStreamErrorDomainPOSIX,
-                    error: e.raw_os_error().unwrap_or(0),
-                },
+        Err(failure) => {
+            let stream_error = stream_error_for(failure);
+            // `CFStreamError` is `repr(C, packed)`, so its fields must be copied
+            // out before they can be referenced by the formatting machinery.
+            let domain = stream_error.domain;
+            let code = stream_error.error;
+            log!(
+                "CFHost: resolving {:?} failed: {} (CFStreamError domain {}, error {})",
+                name_str,
+                failure.description(),
+                domain,
+                code,
             );
+            write_stream_error(env, error, stream_error);
+            env.objc.borrow_mut::<CFHostHostObject>(host).last_error[kCFHostAddresses as usize] =
+                Some(stream_error);
             false
         }
     }
@@ -492,6 +584,7 @@ fn start_names(env: &mut Environment, host: CFHostRef, _error: MutPtr<CFStreamEr
     let h = env.objc.borrow_mut::<CFHostHostObject>(host);
     h.resolved_names = names;
     h.resolved[kCFHostNames as usize] = true;
+    h.last_error[kCFHostNames as usize] = None;
     true
 }
 
@@ -791,6 +884,21 @@ fn CFHostGetReachability(
 
 fn libc_EINVAL() -> i32 {
     22
+}
+
+/// `ETIMEDOUT` on Darwin/POSIX.
+fn libc_ETIMEDOUT() -> i32 {
+    60
+}
+
+/// `h_errno` value for "no such host" (`netdb.h`: `HOST_NOT_FOUND`).
+fn h_errno_host_not_found() -> i32 {
+    1
+}
+
+/// `h_errno` value for "temporary resolver failure" (`netdb.h`: `TRY_AGAIN`).
+fn h_errno_try_again() -> i32 {
+    2
 }
 
 /// Reads `sockaddr`'s `sa_len` byte without constructing a misaligned

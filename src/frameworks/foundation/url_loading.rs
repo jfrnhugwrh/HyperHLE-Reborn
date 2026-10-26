@@ -14,7 +14,9 @@ use crate::frameworks::foundation::ns_string::{from_rust_string, to_rust_string}
 use crate::frameworks::foundation::{NSInteger, NSUInteger};
 use crate::mem::MutPtr;
 use crate::mem::MutVoidPtr;
+use crate::frameworks::foundation::legacy_analytics as legacy_analytics_interception;
 use crate::objc::{autorelease, id, msg, msg_class, nil};
+use crate::options::LegacyAnalyticsMode;
 use crate::Environment;
 use std::io::Read;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -378,8 +380,23 @@ fn network_disabled_error() -> HttpError {
 /// Execute a request on the current guest thread (for synchronous Foundation
 /// APIs). As with the real synchronous APIs, this blocks until the response or
 /// timeout is received.
-pub fn send(request: Result<HttpRequest, HttpError>, network_access: bool) -> HttpResult {
+///
+/// Requests addressed to retired third-party analytics/ad endpoints are
+/// answered first, according to `legacy_analytics`; see
+/// [crate::frameworks::foundation::legacy_analytics]. This happens *before* the
+/// `network_access` check on purpose: those services cannot answer, and the
+/// whole point of the interception is that no DNS lookup or socket is created
+/// (so the caller gets its answer immediately regardless of the network
+/// configuration).
+pub fn send(
+    request: Result<HttpRequest, HttpError>,
+    network_access: bool,
+    legacy_analytics: LegacyAnalyticsMode,
+) -> HttpResult {
     let request = request?;
+    if let Some(result) = legacy_analytics_interception::intercept(&request, legacy_analytics) {
+        return result;
+    }
     if !network_access {
         return Err(network_disabled_error());
     }
@@ -397,7 +414,11 @@ pub fn send(request: Result<HttpRequest, HttpError>, network_access: bool) -> Ht
 /// Execute a request away from the guest thread. Callbacks must still be
 /// delivered by the caller on the guest/run-loop thread after receiving this
 /// channel's result.
-pub fn send_async(request: Result<HttpRequest, HttpError>, network_access: bool) -> HttpReceiver {
+pub fn send_async(
+    request: Result<HttpRequest, HttpError>,
+    network_access: bool,
+    legacy_analytics: LegacyAnalyticsMode,
+) -> HttpReceiver {
     let (sender, receiver) = mpsc::channel();
     let request = match request {
         Ok(request) => request,
@@ -406,6 +427,13 @@ pub fn send_async(request: Result<HttpRequest, HttpError>, network_access: bool)
             return receiver;
         }
     };
+    // Answer retired analytics/ad endpoints synchronously (on the caller's
+    // thread): there is nothing to wait for, and starting a worker thread would
+    // only delay the "service is down" answer the SDK is waiting on.
+    if let Some(result) = legacy_analytics_interception::intercept(&request, legacy_analytics) {
+        let _ = sender.send(result);
+        return receiver;
+    }
     if !network_access {
         let _ = sender.send(Err(network_disabled_error()));
         return receiver;
@@ -586,6 +614,7 @@ pub fn write_error_out_parameter(env: &mut Environment, error_ptr: MutVoidPtr, e
 #[cfg(test)]
 mod tests {
     use super::{send, send_async, HttpRequest};
+    use crate::options::LegacyAnalyticsMode;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
@@ -614,7 +643,12 @@ mod tests {
         let url = serve_one(
             b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 8\r\nConnection: close\r\n\r\n{\"ok\":1}",
         );
-        let response = send(Ok(HttpRequest::get(url)), true).unwrap();
+        let response = send(
+            Ok(HttpRequest::get(url)),
+            true,
+            LegacyAnalyticsMode::Passthrough,
+        )
+        .unwrap();
         assert_eq!(response.status_code, 200);
         assert_eq!(response.body, br#"{"ok":1}"#.to_vec());
         assert!(response
@@ -628,7 +662,12 @@ mod tests {
         let url = serve_one(
             b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot found",
         );
-        let response = send(Ok(HttpRequest::get(url)), true).unwrap();
+        let response = send(
+            Ok(HttpRequest::get(url)),
+            true,
+            LegacyAnalyticsMode::Passthrough,
+        )
+        .unwrap();
         assert_eq!(response.status_code, 404);
         assert_eq!(response.body, b"not found".to_vec());
     }
@@ -636,7 +675,11 @@ mod tests {
     #[test]
     fn asynchronous_requests_return_worker_results() {
         let url = serve_one(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
-        let response = send_async(Ok(HttpRequest::get(url)), true)
+        let response = send_async(
+            Ok(HttpRequest::get(url)),
+            true,
+            LegacyAnalyticsMode::Passthrough,
+        )
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
             .unwrap();
@@ -646,9 +689,44 @@ mod tests {
 
     #[test]
     fn disabled_access_returns_the_documented_url_error() {
-        let error = send(Ok(HttpRequest::get("http://127.0.0.1/".to_string())), false).unwrap_err();
+        let error = send(
+            Ok(HttpRequest::get("http://127.0.0.1/".to_string())),
+            false,
+            LegacyAnalyticsMode::Passthrough,
+        )
+        .unwrap_err();
         assert_eq!(error.code, -1009);
         assert!(error.description.contains("--allow-network-access"));
+    }
+
+    #[test]
+    fn retired_analytics_endpoints_are_answered_without_the_network() {
+        // Neither of these hosts resolves any more; the point of the mock is
+        // that the request never reaches the resolver, so this must be both
+        // instant and independent of --allow-network-access.
+        for network_access in [false, true] {
+            let response = send(
+                Ok(HttpRequest::get(
+                    "http://api2.playhaven.com/v3/publisher/open".to_string(),
+                )),
+                network_access,
+                LegacyAnalyticsMode::MockServiceUnavailable,
+            )
+            .unwrap();
+            assert_eq!(response.status_code, 503);
+        }
+
+        let error = send_async(
+            Ok(HttpRequest::get(
+                "https://app.crittercism.com/api_beta/crash".to_string(),
+            )),
+            true,
+            LegacyAnalyticsMode::FailFast,
+        )
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.code, -1003);
     }
 
     #[test]
@@ -656,6 +734,7 @@ mod tests {
         let error = send(
             Ok(HttpRequest::get("ftp://example.invalid/file".to_string())),
             true,
+            LegacyAnalyticsMode::Passthrough,
         )
         .unwrap_err();
         assert_eq!(error.code, -1002);

@@ -372,7 +372,16 @@ com.turner.bestparkintheuniverse: --xml-dom-mirror
 # stall per frame). The underlying glDiscardFramebufferEXT /
 # GL_INVALID_ENUM causes are fixed generally in the GLES backends;
 # these flags are the per-app presentation/XML workarounds.
-com.turner.ghosttoasters: --xml-dom-mirror --present-mode=direct
+#
+# `--legacy-analytics=mock` is listed explicitly because this game starts
+# PlayHaven (api2.playhaven.com, media.playhaven.com) and Crittercism on its
+# initialisation thread; both services have been shut down, so their host
+# names no longer resolve and iOS answers with a fast connection failure. The
+# emulator reproduces that locally instead of leaking a DNS query to whoever
+# owns the domains today. `mock` (the default) returns a synthetic HTTP 503,
+# `fail` returns NSURLErrorCannotFindHost (-1003), `passthrough` restores the
+# old blocking real-network behaviour.
+com.turner.ghosttoasters: --xml-dom-mirror --present-mode=direct --legacy-analytics=mock
 
 # LEGO Ninjago: The Final Battle
 # Uses OpenAL streaming audio; keep its fixed-function landscape profile and

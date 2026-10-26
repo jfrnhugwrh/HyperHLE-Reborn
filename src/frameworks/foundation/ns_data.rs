@@ -222,6 +222,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let result = crate::frameworks::foundation::url_loading::send(
         crate::frameworks::foundation::url_loading::get_request_from_url(env, url),
         env.options.network_access,
+        env.options.legacy_analytics,
     );
     match result {
         Ok(response) => {

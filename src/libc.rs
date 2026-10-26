@@ -24,6 +24,7 @@ pub mod dirent;
 pub mod dispatch;
 pub mod dispatch_source;
 pub mod dlfcn;
+pub mod dns_lookup;
 pub mod dns_sd;
 pub mod errno;
 pub mod execinfo;

@@ -439,6 +439,33 @@ Other options:
         including HTTP/HTTPS URL-loading APIs (NSURLConnection, NSURLSession, and NSData).
         Disabled by default.
 
+    --legacy-analytics=<mode>
+        How HTTP requests to analytics/advertising services that no longer exist
+        are answered. Several services bundled into 2009-2014 iPhone games
+        (PlayHaven, Crittercism, ...) shut down years ago, but their SDKs still
+        run during app launch and try to contact them. Letting such a request go
+        out can block the emulator on a host name lookup, which freezes the game
+        before its first frame - the familiar "black screen after the publisher
+        logo".
+
+        mock (default):
+            Answer locally with a synthetic HTTP 503 Service Unavailable and a
+            JSON body. No DNS lookup and no socket is involved, so the SDK's
+            start-up code fails fast and lets the game continue.
+
+        fail:
+            Fail immediately with NSURLErrorCannotFindHost (-1003), which is what
+            a device reports today for these host names.
+
+        passthrough:
+            Do not intercept. The request is treated like any other request and
+            is therefore subject to --allow-network-access.
+
+        Only known-defunct domains are affected; every other request is left
+        alone. Independently of this option, host name lookups are bounded by
+        the TOUCHHLE_DNS_TIMEOUT_MS environment variable (default 1500 ms) so a
+        slow or unreachable resolver cannot freeze the emulator.
+
     --ignore-gl-errors
         Ignore host OpenGL errors as queried by glGetError function.
         This only affects return value of glGetError as seen by the guest

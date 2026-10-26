@@ -1713,17 +1713,40 @@ fn glDiscardFramebufferEXT(
 ) {
     // GL_EXT_discard_framebuffer is a bandwidth hint. On tile-based GPUs
     // (ARM Mali, Qualcomm Adreno, PowerVR) honouring it lets the driver skip
-    // writing tile memory back to system RAM at the end of the frame. The
-    // guest attachment enums (GL_COLOR_EXT / GL_DEPTH_EXT / GL_STENCIL_EXT)
-    // share their values with the host extension, so forward them unchanged.
+    // writing tile memory back to system RAM at the end of the frame.
+    //
+    // Do not forward the guest's list verbatim:
+    //
+    // * Engines mix the EXT vocabulary (GL_COLOR_EXT/GL_DEPTH_EXT/
+    //   GL_STENCIL_EXT) with the FBO one (GL_COLOR_ATTACHMENT0/
+    //   GL_DEPTH_ATTACHMENT/GL_STENCIL_ATTACHMENT). iOS's PowerVR driver
+    //   accepts both; strict hosts (ANGLE on Android) answer the wrong
+    //   one with a sticky GL_INVALID_ENUM (0x500), which the guest then
+    //   reads back from glGetError() during initialisation even though
+    //   nothing actually failed. Canonicalize first (see
+    //   `canonical_discard_attachments`) and drop anything inexpressible.
+    // * numAttachments <= 0 or a NULL list is a no-op here, not a reason
+    //   to index guest memory (or pass a wild pointer on to the driver).
+    if numAttachments <= 0 || attachments.is_null() {
+        return;
+    }
     with_ctx_and_mem(env, |gles, mem| unsafe {
-        let n = numAttachments.max(0) as GuestUSize;
-        let ptr = if n == 0 || attachments.is_null() {
-            std::ptr::null()
-        } else {
-            mem.bytes_at(attachments.cast(), n * 4).as_ptr().cast()
-        };
-        gles.DiscardFramebufferEXT(target, numAttachments, ptr);
+        let n = numAttachments as GuestUSize;
+        let guest_list: Vec<GLenum> = mem
+            .bytes_at(attachments.cast(), n * 4)
+            .chunks_exact(4)
+            .map(|bytes| GLenum::from_le_bytes(bytes.try_into().unwrap()))
+            .collect();
+        let canonical = crate::gles::canonical_discard_attachments(&guest_list);
+        if canonical.is_empty() {
+            // Nothing the host can express: the hint is consumed.
+            return;
+        }
+        gles.DiscardFramebufferEXT(
+            target,
+            canonical.len() as GLsizei,
+            canonical.as_ptr(),
+        );
     });
 }
 
@@ -6889,6 +6912,12 @@ fn glInvalidateFramebuffer(
     num_attachments: GLsizei,
     attachments: ConstPtr<GLenum>,
 ) {
+    // A negative count cast to GuestUSize would size a huge guest-memory
+    // read; a NULL list with a positive count is invalid too. Invalidate
+    // is a hint, so consume both quietly instead of trapping.
+    if num_attachments <= 0 || attachments.is_null() {
+        return;
+    }
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let slice = mem.bytes_at(attachments.cast(), (num_attachments as GuestUSize) * 4);
         gles.InvalidateFramebuffer(target, num_attachments, slice.as_ptr().cast())
@@ -6906,6 +6935,9 @@ fn glInvalidateSubFramebuffer(
     width: GLsizei,
     height: GLsizei,
 ) {
+    if num_attachments <= 0 || attachments.is_null() {
+        return;
+    }
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let slice = mem.bytes_at(attachments.cast(), (num_attachments as GuestUSize) * 4);
         gles.InvalidateSubFramebuffer(

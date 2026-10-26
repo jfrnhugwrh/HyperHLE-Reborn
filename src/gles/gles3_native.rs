@@ -301,6 +301,52 @@ impl GLES for GLES3Native<'_> {
         true
     }
 
+    fn discard_ext_supported(&self) -> bool {
+        // ES 3.0 core glInvalidateFramebuffer subsumes the EXT hint.
+        true
+    }
+
+    unsafe fn DiscardFramebufferEXT(
+        &mut self,
+        target: GLenum,
+        num_attachments: GLsizei,
+        attachments: *const GLenum,
+    ) -> bool {
+        // ES 3.0 has no EXT entry point here; core InvalidateFramebuffer
+        // is the equivalent, but it speaks a different attachment
+        // vocabulary when an FBO is bound (GL_COLOR_ATTACHMENT0 &c.
+        // instead of GL_COLOR_EXT &c.). Forwarding the guest's raw
+        // GL_*_EXT values — the old naive approach — is exactly what
+        // makes strict drivers raise GL_INVALID_ENUM, so translate
+        // based on the binding for the addressed target first.
+        if num_attachments <= 0 || attachments.is_null() {
+            return false;
+        }
+        let binding_pname = match target {
+            0x8D40 | 0x8CA9 => gles30::DRAW_FRAMEBUFFER_BINDING,
+            0x8CA8 => gles30::READ_FRAMEBUFFER_BINDING,
+            _ => return false,
+        };
+        let mut bound: GLint = 0;
+        gles30::GetIntegerv(binding_pname, &mut bound);
+        let guest_list =
+            std::slice::from_raw_parts(attachments, num_attachments as usize);
+        let canonical = crate::gles::canonical_discard_attachments(guest_list);
+        if canonical.is_empty() {
+            return false;
+        }
+        let translated = crate::gles::invalidate_attachments_for_discard(
+            &canonical,
+            bound == 0,
+        );
+        gles30::InvalidateFramebuffer(
+            target,
+            translated.len() as GLsizei,
+            translated.as_ptr(),
+        );
+        true
+    }
+
     unsafe fn driver_description(&self) -> String {
         let version = CStr::from_ptr(gles30::GetString(gles30::VERSION) as *const _);
         let vendor = CStr::from_ptr(gles30::GetString(gles30::VENDOR) as *const _);

@@ -414,6 +414,98 @@ pub trait GLESContext {
     ) -> Box<dyn GLES + 'gl_ctx>;
 }
 
+/// Canonical `GL_EXT_discard_framebuffer` attachment for colour.
+pub(crate) const DISCARD_COLOR_EXT: GLenum = 0x1800; // GL_COLOR_EXT
+/// Canonical `GL_EXT_discard_framebuffer` attachment for depth.
+pub(crate) const DISCARD_DEPTH_EXT: GLenum = 0x1801; // GL_DEPTH_EXT
+/// Canonical `GL_EXT_discard_framebuffer` attachment for stencil.
+pub(crate) const DISCARD_STENCIL_EXT: GLenum = 0x1802; // GL_STENCIL_EXT
+
+/// Reduce a guest discard/invalidate attachment list to the canonical
+/// `GL_*_EXT` vocabulary of `GL_EXT_discard_framebuffer`.
+///
+/// Real iOS drivers (PowerVR) are lenient about which vocabulary the
+/// caller used, and engines shipped for iPhone OS mix them freely:
+/// cocos2d-style code passes `GL_COLOR_EXT`/`GL_DEPTH_EXT`/
+/// `GL_STENCIL_EXT` (0x1800–0x1802), while FBO-oriented code passes
+/// `GL_COLOR_ATTACHMENT0`/`GL_DEPTH_ATTACHMENT`/`GL_STENCIL_ATTACHMENT`.
+///
+/// Strict host drivers are not lenient: ANGLE (the usual Android ES 2.0
+/// host) answers the wrong vocabulary with a sticky `GL_INVALID_ENUM`
+/// (0x500). A guest that checks `glGetError()` during start-up — as
+/// engines do after creating their framebuffer — then sees a failure
+/// that never happened on iOS and can stall or retry initialisation
+/// (e.g. *Ghost Toasters*'s splash screen). Discarding is only a hint,
+/// so dropping an attachment we cannot express (e.g.
+/// `GL_COLOR_ATTACHMENT1`, which has no `GL_EXT_discard_framebuffer`
+/// equivalent) is always safe; forwarding it is not.
+///
+/// `GL_DEPTH_STENCIL_ATTACHMENT` expands to its two components.
+/// Duplicates are removed, first occurrence wins. The result may be
+/// empty, in which case the caller must not make a host call at all.
+pub(crate) fn canonical_discard_attachments(attachments: &[GLenum]) -> Vec<GLenum> {
+    const COLOR_ATTACHMENT0: GLenum = 0x8CE0;
+    const DEPTH_ATTACHMENT: GLenum = 0x8D00;
+    const STENCIL_ATTACHMENT: GLenum = 0x8D20;
+    const DEPTH_STENCIL_ATTACHMENT: GLenum = 0x821A;
+
+    let mut out: Vec<GLenum> = Vec::with_capacity(attachments.len());
+    let mut push = |out: &mut Vec<GLenum>, value: GLenum| {
+        if !out.contains(&value) {
+            out.push(value);
+        }
+    };
+    for &attachment in attachments {
+        match attachment {
+            DISCARD_COLOR_EXT | COLOR_ATTACHMENT0 => push(&mut out, DISCARD_COLOR_EXT),
+            DISCARD_DEPTH_EXT | DEPTH_ATTACHMENT => push(&mut out, DISCARD_DEPTH_EXT),
+            DISCARD_STENCIL_EXT | STENCIL_ATTACHMENT => push(&mut out, DISCARD_STENCIL_EXT),
+            DEPTH_STENCIL_ATTACHMENT => {
+                push(&mut out, DISCARD_DEPTH_EXT);
+                push(&mut out, DISCARD_STENCIL_EXT);
+            }
+            // Unknown/other attachments: drop them (see above) instead
+            // of letting the host driver raise GL_INVALID_ENUM.
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Translate canonical discard attachments (see
+/// [canonical_discard_attachments]) into the attachment vocabulary of
+/// core `glInvalidateFramebuffer` (ES 3.0 / desktop GL), which is what
+/// backends without `GL_EXT_discard_framebuffer` must use instead.
+///
+/// The two vocabularies only agree for the *default* framebuffer:
+/// `GL_COLOR`/`GL_DEPTH`/`GL_STENCIL` are numerically 0x1800–0x1802,
+/// exactly the `GL_*_EXT` values. With a framebuffer object bound the
+/// core entry point expects `GL_COLOR_ATTACHMENT0`/
+/// `GL_DEPTH_ATTACHMENT`/`GL_STENCIL_ATTACHMENT` — passing the raw
+/// `GL_*_EXT` values there is precisely the `GL_INVALID_ENUM` (0x500)
+/// a naive forwarding produces on ANGLE/ES 3.0 hosts.
+pub(crate) fn invalidate_attachments_for_discard(
+    canonical: &[GLenum],
+    default_framebuffer: bool,
+) -> Vec<GLenum> {
+    const COLOR_ATTACHMENT0: GLenum = 0x8CE0;
+    const DEPTH_ATTACHMENT: GLenum = 0x8D00;
+    const STENCIL_ATTACHMENT: GLenum = 0x8D20;
+
+    if default_framebuffer {
+        return canonical.to_vec();
+    }
+    canonical
+        .iter()
+        .map(|&attachment| match attachment {
+            DISCARD_COLOR_EXT => COLOR_ATTACHMENT0,
+            DISCARD_DEPTH_EXT => DEPTH_ATTACHMENT,
+            DISCARD_STENCIL_EXT => STENCIL_ATTACHMENT,
+            other => other,
+        })
+        .collect()
+}
+
 /// An active GLES context that can be used.
 ///
 /// These are effectively direct wrappers around the raw OpenGL functions,
@@ -486,11 +578,16 @@ pub trait GLES {
     /// "External memory bandwidth" / tile write-back sections of ARM's
     /// Mali-G57 performance counters reference guide.
     ///
-    /// `attachments` must already be translated to attachment enums the host
-    /// driver accepts (`GL_COLOR_EXT` / `GL_DEPTH_EXT` / `GL_STENCIL_EXT` or
-    /// the equivalent attachment enums). Returns `true` if the host call was
+    /// `attachments` is in the canonical `GL_*_EXT` vocabulary (see
+    /// [canonical_discard_attachments]; the guest entry point normalizes
+    /// it). Backends whose host speaks a different vocabulary (core
+    /// `glInvalidateFramebuffer`) must translate with
+    /// [invalidate_attachments_for_discard] — forwarding the canonical
+    /// values to it verbatim raises `GL_INVALID_ENUM` whenever a
+    /// framebuffer object is bound. Returns `true` if the host call was
     /// made, `false` when the backend has no equivalent (callers treat the
-    /// discard as consumed either way — it is only a hint).
+    /// discard as consumed either way — it is only a hint, and a backend
+    /// must never let it raise a guest-visible GL error).
     unsafe fn DiscardFramebufferEXT(
         &mut self,
         _target: GLenum,
@@ -3284,6 +3381,58 @@ mod tests {
         for (backend, expected) in profiles {
             assert_eq!(backend.diagnostic_profile(), expected);
         }
+    }
+
+    #[test]
+    fn discard_attachments_are_canonicalized_from_both_vocabularies() {
+        use super::{
+            canonical_discard_attachments, DISCARD_COLOR_EXT, DISCARD_DEPTH_EXT,
+            DISCARD_STENCIL_EXT,
+        };
+
+        // EXT vocabulary passes through, duplicates collapse.
+        assert_eq!(
+            canonical_discard_attachments(&[DISCARD_DEPTH_EXT, DISCARD_DEPTH_EXT]),
+            vec![DISCARD_DEPTH_EXT]
+        );
+        // FBO vocabulary (what strict drivers would reject in a discard
+        // call with GL_INVALID_ENUM) maps onto the same canonical list.
+        assert_eq!(
+            canonical_discard_attachments(&[0x8CE0, 0x8D00, 0x8D20]),
+            vec![DISCARD_COLOR_EXT, DISCARD_DEPTH_EXT, DISCARD_STENCIL_EXT]
+        );
+        // Depth+stencil expands; inexpressible attachments are dropped
+        // rather than forwarded to the host driver.
+        assert_eq!(
+            canonical_discard_attachments(&[0x821A, 0x8CE1, 0xDEAD]),
+            vec![DISCARD_DEPTH_EXT, DISCARD_STENCIL_EXT]
+        );
+        assert!(canonical_discard_attachments(&[0xDEAD]).is_empty());
+        assert!(canonical_discard_attachments(&[]).is_empty());
+    }
+
+    #[test]
+    fn discard_attachments_translate_for_core_invalidate() {
+        use super::{
+            invalidate_attachments_for_discard, DISCARD_COLOR_EXT, DISCARD_DEPTH_EXT,
+            DISCARD_STENCIL_EXT,
+        };
+
+        let canonical = [
+            DISCARD_COLOR_EXT,
+            DISCARD_DEPTH_EXT,
+            DISCARD_STENCIL_EXT,
+        ];
+        // Default framebuffer: the numeric values already agree.
+        assert_eq!(
+            invalidate_attachments_for_discard(&canonical, true),
+            canonical.to_vec()
+        );
+        // FBO bound: core glInvalidateFramebuffer wants attachment points.
+        assert_eq!(
+            invalidate_attachments_for_discard(&canonical, false),
+            vec![0x8CE0, 0x8D00, 0x8D20]
+        );
     }
 
     #[test]

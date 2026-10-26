@@ -290,6 +290,49 @@ impl GLES for GLES3OnGL3<'_> {
         self.advertise_es3
     }
 
+    fn discard_ext_supported(&self) -> bool {
+        // Desktop GL's InvalidateFramebuffer (ARB_invalidate_subdata,
+        // in the binding registry) subsumes the EXT hint.
+        true
+    }
+
+    unsafe fn DiscardFramebufferEXT(
+        &mut self,
+        target: GLenum,
+        num_attachments: GLsizei,
+        attachments: *const GLenum,
+    ) -> bool {
+        // Same translation as the native ES 3.0 backend (see there):
+        // core glInvalidateFramebuffer rejects raw GL_*_EXT values with
+        // GL_INVALID_ENUM when a framebuffer object is bound.
+        if num_attachments <= 0 || attachments.is_null() {
+            return false;
+        }
+        let binding_pname = match target {
+            0x8D40 | 0x8CA9 => gl33::DRAW_FRAMEBUFFER_BINDING,
+            0x8CA8 => gl33::READ_FRAMEBUFFER_BINDING,
+            _ => return false,
+        };
+        let mut bound: GLint = 0;
+        gl33::GetIntegerv(binding_pname, &mut bound);
+        let guest_list =
+            std::slice::from_raw_parts(attachments, num_attachments as usize);
+        let canonical = crate::gles::canonical_discard_attachments(guest_list);
+        if canonical.is_empty() {
+            return false;
+        }
+        let translated = crate::gles::invalidate_attachments_for_discard(
+            &canonical,
+            bound == 0,
+        );
+        gl33::InvalidateFramebuffer(
+            target,
+            translated.len() as GLsizei,
+            translated.as_ptr(),
+        );
+        true
+    }
+
     unsafe fn driver_description(&self) -> String {
         let version = CStr::from_ptr(gl33::GetString(gl33::VERSION) as *const _);
         let vendor = CStr::from_ptr(gl33::GetString(gl33::VENDOR) as *const _);

@@ -363,6 +363,17 @@ com.disney.SwampyGame: --device-family=iphone-3gs --xml-dom-mirror
 # game never gets past the splash screen.
 com.turner.bestparkintheuniverse: --xml-dom-mirror
 
+# Ghost Toasters - Regular Show: same Turner/Cartoon Network stack as
+# Best Park above, and it hung on the Cartoon Network splash screen on
+# Android (ANGLE OpenGL ES 2.0). Keep the libxml2 guest DOM mirror for
+# its direct xmlNode field reads, and present directly on the GPU: its
+# CAEAGLLayer is not recognised as the fullscreen layer, so every frame
+# otherwise fell back to the RAM-readback slow path (a full pipeline
+# stall per frame). The underlying glDiscardFramebufferEXT /
+# GL_INVALID_ENUM causes are fixed generally in the GLES backends;
+# these flags are the per-app presentation/XML workarounds.
+com.turner.ghosttoasters: --xml-dom-mirror --present-mode=direct
+
 # LEGO Ninjago: The Final Battle
 # Uses OpenAL streaming audio; keep its fixed-function landscape profile and
 # force the compatibility texture filter on strict mobile GLES drivers.

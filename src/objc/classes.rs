@@ -2710,7 +2710,9 @@ pub fn class_getName(env: &mut crate::Environment, cls: Class) -> ConstPtr<u8> {
         return Ptr::null();
     }
     if let Some(&cached) = env.objc.class_name_cstrings.get(&cls) {
-        return cached.cast_const();
+        // The cache stores `void *` so it does not need the element type;
+        // re-attach `u8` here to match the `const char *` return type.
+        return cached.cast_const().cast();
     }
     let name = env.objc.get_class_name(cls).to_owned();
     let bytes = name.as_bytes();

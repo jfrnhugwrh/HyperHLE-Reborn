@@ -236,6 +236,36 @@ impl ObjC {
         methods.contains_key(&sel)
     }
 
+    /// The implementation a message with `sel` sent to `class` would run,
+    /// without running it. `None` if no class in the chain implements it.
+    ///
+    /// For a class method, `class` must be the *metaclass* (i.e. what
+    /// [Self::read_isa] returns for a class object), because that is where the
+    /// dispatcher starts looking for class methods.
+    ///
+    /// This exists so the runtime can distinguish its own methods (`IMP::Host`,
+    /// part of the emulator) from the guest's (`IMP::Guest`, part of the app).
+    /// The two must not be treated alike where a guest override would change
+    /// the meaning of a runtime primitive — see `+[NSObject alloc]`.
+    pub fn method_imp(&self, class: Class, sel: SEL) -> Option<IMP> {
+        let mut class = class;
+        loop {
+            // `class_host_object` rather than `borrow` so that placeholder
+            // classes (`FakeClass`, `UnimplementedClass`) end the walk instead
+            // of panicking on a type mismatch.
+            let Some(host_object) = self.class_host_object(class) else {
+                return None;
+            };
+            if let Some(&imp) = host_object.methods.get(&sel) {
+                return Some(imp);
+            }
+            if host_object.superclass == nil {
+                return None;
+            }
+            class = host_object.superclass;
+        }
+    }
+
     pub fn class_get_method_signature(&self, class: Class, sel: SEL) -> Option<&ConstPtr<u8>> {
         // TODO: support `host` method signatures
         let mut class = class;

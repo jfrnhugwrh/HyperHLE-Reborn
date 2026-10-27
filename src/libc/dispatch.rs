@@ -1074,7 +1074,7 @@ fn dispatch_debug(_env: &mut Environment, _object: MutVoidPtr, _message: ConstVo
 /// On ARM32 a block is a struct whose second word is the invoke function
 //pointer.
 /// Layout: [isa, flags, reserved, invoke, descriptor, captures...]
-pub(super) fn call_void_block(env: &mut Environment, block: dispatch_block_t) {
+pub(crate) fn call_void_block(env: &mut Environment, block: dispatch_block_t) {
     let invoke_ptr = env.mem.read(block.cast::<u32>() + 3u32);
     if invoke_ptr == 0 {
         return;

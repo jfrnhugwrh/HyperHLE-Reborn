@@ -297,8 +297,48 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 @implementation NSObject
 
+// `+alloc` in Apple's runtime is a *primitive*: it creates an instance of the
+// receiving class directly and does **not** re-send `+allocWithZone:` to the
+// receiver (see `NSObject.mm`: `+alloc` calls `_objc_rootAlloc(self)`, while
+// `+allocWithZone:` is separate).
+//
+// Re-sending it is not a harmless implementation detail, because it breaks the
+// singleton pattern Apple documents in
+// <https://developer.apple.com/library/archive/documentation/General/Conceptual/DevPedia-CocoaCore/Singleton.html>:
+//
+//     + (id)allocWithZone:(NSZone *)zone { return [[self sharedInstance] retain]; }
+//     + (id)sharedInstance { ... instance = [[super allocWithZone:NULL] init]; ... }
+//
+// If `+alloc` re-entered the override, `sharedInstance` → `alloc` →
+// `allocWithZone:` → `sharedInstance` would recurse forever. Ghost Toasters'
+// Adobe/PlayHaven SDK does exactly this (`ADMS_Measurement`): with the old
+// implementation the emulator recursed until the dispatch-cycle guard cut it
+// off, and the guard's zeroed return meant `+sharedInstance` answered `nil`
+// for the rest of the session, so the SDK's start-up silently did nothing.
+//
+// touchHLE's *own* classes use `+allocWithZone:` as their allocation hook
+// (e.g. `+[NSArray allocWithZone:]` returns a private concrete class, and the
+// iOS singletons implemented here return their shared instance). Those are part
+// of the emulator, not guest code, so the hook is still honoured — it is only
+// *guest* overrides of `+allocWithZone:` that must not be entered from here.
 + (id)alloc {
-    msg![env; this allocWithZone:(MutVoidPtr::null())]
+    let metaclass = ObjC::read_isa(this, &env.mem);
+    let alloc_with_zone = match env.objc.lookup_selector("allocWithZone:") {
+        Some(sel) => env.objc.method_imp(metaclass, sel),
+        None => None,
+    };
+    match alloc_with_zone {
+        // The emulator's own allocation hook (see above).
+        Some(crate::objc::IMP::Host(_)) => msg![env; this allocWithZone:(MutVoidPtr::null())],
+        // No override, or a guest override: allocate directly, like the
+        // primitive does.
+        _ => {
+            log_dbg!("[{:?} alloc] (primitive)", this);
+            let object = env.objc.alloc_object(this, Box::new(TrivialHostObject), &mut env.mem);
+            invoke_cxx_constructors(env, object);
+            object
+        }
+    }
 }
 + (id)allocWithZone:(NSZonePtr)_zone {
     log_dbg!("[{:?} allocWithZone:]", this);

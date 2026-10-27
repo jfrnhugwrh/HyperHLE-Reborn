@@ -4,15 +4,19 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 //! `NSPersistentStoreCoordinator` and related Core Data classes.
-//! These are stubbed — Core Data persistence is not implemented.
+//! The managed object model, entity registry and object graph are implemented
+//! (apps routinely build their model in code and ask the context for entities
+//! during start-up); persistence to SQLite is not, and store files are never
+//! touched.
 
 use crate::dyld::{ConstantExports, HostConstant};
+use crate::libc::dispatch::call_void_block;
 use crate::frameworks::foundation::ns_string;
 use crate::frameworks::foundation::{NSInteger, NSUInteger};
 use crate::mem::MutPtr;
 use crate::objc::{
-    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
-    NSZonePtr,
+    autorelease, id, impl_HostObject_with_superclass, msg, msg_class, nil, objc_classes, release,
+    retain, Class, ClassExports, HostObject, NSZonePtr,
 };
 
 // MARK: - NSPersistentStoreCoordinator
@@ -60,6 +64,14 @@ struct NSManagedObjectContextHostObject {
     parent_context: id,
     undo_manager: id,
     merge_policy: id,
+    /// `NSMutableSet<NSManagedObject*>*` — every object registered with this
+    /// context, inserted or fetched.
+    registered_objects: id,
+    /// `NSMutableSet<NSManagedObject*>*` — registered objects that were
+    /// inserted and not yet saved.
+    inserted_objects: id,
+    /// `NSMutableSet<NSManagedObject*>*` — objects deleted since the last save.
+    deleted_objects: id,
 }
 impl HostObject for NSManagedObjectContextHostObject {}
 
@@ -69,6 +81,142 @@ fn clear_error_out_parameter(env: &mut crate::Environment, error: MutPtr<id>) {
     if !error.is_null() {
         env.mem.write(error, nil);
     }
+}
+
+// MARK: - Model lookups
+
+/// Compares two `NSString`s through the guest's own string class, so guest
+/// string subclasses (constant strings, `NSCFString`, …) behave correctly and
+/// we never borrow a `StringHostObject` out of an object that isn't one.
+fn strings_equal(env: &mut crate::Environment, a: id, b: id) -> bool {
+    if a == b {
+        return true;
+    }
+    if a == nil || b == nil {
+        return false;
+    }
+    msg![env; a isEqualToString:b]
+}
+
+/// Finds the entity called `name` in `model` (`NSManagedObjectModel`), or
+/// `nil`. Per Apple, `-[NSManagedObjectModel entitiesByName]` is the lookup
+/// index, but the entities array is the storage of record, so match on it.
+fn entity_in_model(env: &mut crate::Environment, model: id, name: id) -> id {
+    if model == nil || name == nil {
+        return nil;
+    }
+    let entities: id = msg![env; model entities];
+    if entities == nil {
+        return nil;
+    }
+    let count: NSUInteger = msg![env; entities count];
+    for i in 0..count {
+        let entity: id = msg![env; entities objectAtIndex:i];
+        if entity == nil {
+            continue;
+        }
+        let entity_name: id = msg![env; entity name];
+        if strings_equal(env, entity_name, name) {
+            return entity;
+        }
+    }
+    nil
+}
+
+/// `+[NSEntityDescription entityForName:inManagedObjectContext:]`: Apple, _Core
+/// Data Programming Guide_: "the entity is looked up in the managed object
+/// model associated with the context". That model is reached through the
+/// context's persistent store coordinator.
+fn entity_named(env: &mut crate::Environment, name: id, context: id) -> id {
+    if name == nil || context == nil {
+        return nil;
+    }
+    let coordinator: id = msg![env; context persistentStoreCoordinator];
+    if coordinator == nil {
+        log_entity_lookup_failure(env, name, "the context has no persistent store coordinator");
+        return nil;
+    }
+    let model: id = msg![env; coordinator managedObjectModel];
+    if model == nil {
+        log_entity_lookup_failure(env, name, "the coordinator has no managed object model");
+        return nil;
+    }
+    let entity = entity_in_model(env, model, name);
+    if entity == nil {
+        // A silent `nil` here is what made the original boot hang
+        // undiagnosable: the app stops right after this call and says nothing
+        // more, so the log has to say why the lookup failed.
+        let entities: id = msg![env; model entities];
+        let count: NSUInteger = msg![env; entities count];
+        let why = format!("the model has {count} entities");
+        log_entity_lookup_failure(env, name, &why);
+    }
+    entity
+}
+
+/// Reports a failed `+entityForName:inManagedObjectContext:` lookup by name.
+fn log_entity_lookup_failure(env: &mut crate::Environment, name: id, why: &str) {
+    let requested = if name == nil {
+        "<nil>".to_string()
+    } else {
+        ns_string::to_rust_string(env, name).into_owned()
+    };
+    log!("NSEntityDescription: entity \"{requested}\" not found: {why}");
+}
+
+/// Indexes a property collection (array or dictionary, as accepted by
+/// `-setProperties:`) by property name into `by_name`.
+fn index_properties_by_name(env: &mut crate::Environment, properties: id, by_name: id) {
+    if properties == nil || by_name == nil {
+        return;
+    }
+    let enumerator: id = msg![env; properties objectEnumerator];
+    if enumerator == nil {
+        return;
+    }
+    loop {
+        let property: id = msg![env; enumerator nextObject];
+        if property == nil {
+            break;
+        }
+        let name: id = msg![env; property name];
+        if name != nil {
+            () = msg![env; by_name setObject:property forKey:name];
+        }
+    }
+}
+
+/// Returns a new `NSDictionary` of the properties in `by_name` whose class
+/// descends from `class_name` (`NSAttributeDescription`, …). Core Data's
+/// `-attributesByName` and friends are defined this way.
+fn properties_of_class(
+    env: &mut crate::Environment,
+    by_name: id,
+    class_name: &str,
+) -> id {
+    let filtered: id = msg_class![env; NSMutableDictionary new];
+    if by_name == nil {
+        return autorelease(env, filtered);
+    }
+    let wanted: Class = env.objc.get_known_class(class_name, &mut env.mem);
+    let enumerator: id = msg![env; by_name objectEnumerator];
+    if enumerator == nil {
+        return autorelease(env, filtered);
+    }
+    loop {
+        let property: id = msg![env; enumerator nextObject];
+        if property == nil {
+            break;
+        }
+        let matches: bool = msg![env; property isKindOfClass:wanted];
+        if matches {
+            let name: id = msg![env; property name];
+            if name != nil {
+                () = msg![env; filtered setObject:property forKey:name];
+            }
+        }
+    }
+    autorelease(env, filtered)
 }
 
 // MARK: - NSManagedObject
@@ -90,7 +238,11 @@ struct NSEntityDescriptionHostObject {
     name: id,
     /// `NSString*`
     managed_object_class_name: id,
-    /// `NSDictionary<NSString*, NSPropertyDescription*>*`
+    /// `NSArray<NSPropertyDescription*>*` or
+    /// `NSDictionary<NSString*, NSPropertyDescription*>*`, as passed to
+    /// `-setProperties:` (Core Data accepts either).
+    properties: id,
+    /// `NSDictionary<NSString*, NSPropertyDescription*>*` — `-propertiesByName`.
     properties_by_name: id,
 }
 impl HostObject for NSEntityDescriptionHostObject {}
@@ -132,13 +284,21 @@ impl HostObject for NSPropertyDescriptionHostObject {}
 
 #[derive(Default)]
 struct NSAttributeDescriptionHostObject {
+    /// `NSAttributeDescription` is a subclass of `NSPropertyDescription`, and
+    /// inherits its accessors (`-name`, `-setName:`, `-isOptional`, …). Those
+    /// accessors borrow `NSPropertyDescriptionHostObject`, so the state has to
+    /// be embedded here: without it every `[attribute name]` fell into the
+    /// runtime's wrong-type "faking borrow" fallback, which returns a
+    /// throw-away zeroed object — i.e. the entity's properties had no names and
+    /// could not be looked up.
+    superclass: NSPropertyDescriptionHostObject,
     /// NSAttributeType (integer enum)
     attribute_type: NSInteger,
     /// `id` default value
     default_value: id,
     allows_external_binary_data_storage: bool,
 }
-impl HostObject for NSAttributeDescriptionHostObject {}
+impl_HostObject_with_superclass!(NSAttributeDescriptionHostObject);
 
 // Apple Core Data — exported `NSString * const` identifiers used as
 // store-type tags, error-domain names, store-option keys, notification
@@ -642,7 +802,20 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)entitiesByName {
-    msg_class![env; NSDictionary new]
+    let by_name: id = msg_class![env; NSMutableDictionary new];
+    let entities: id = env.objc.borrow::<NSManagedObjectModelHostObject>(this).entities;
+    let count: NSUInteger = msg![env; entities count];
+    for i in 0..count {
+        let entity: id = msg![env; entities objectAtIndex:i];
+        if entity == nil {
+            continue;
+        }
+        let name: id = msg![env; entity name];
+        if name != nil {
+            () = msg![env; by_name setObject:entity forKey:name];
+        }
+    }
+    autorelease(env, by_name)
 }
 
 - (id)configurations {
@@ -672,6 +845,9 @@ pub const CLASSES: ClassExports = objc_classes! {
         parent_context: nil,
         undo_manager: nil,
         merge_policy: nil,
+        registered_objects: msg_class![env; NSMutableSet new],
+        inserted_objects: msg_class![env; NSMutableSet new],
+        deleted_objects: msg_class![env; NSMutableSet new],
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
@@ -686,9 +862,19 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())dealloc {
     let host = env.objc.borrow::<NSManagedObjectContextHostObject>(this);
-    let (psc, undo) = (host.persistent_store_coordinator, host.undo_manager);
+    let (psc, undo, registered, inserted, deleted) = (
+        host.persistent_store_coordinator,
+        host.undo_manager,
+        host.registered_objects,
+        host.inserted_objects,
+        host.deleted_objects,
+    );
     release(env, psc);
     release(env, undo);
+    // The sets release the objects they retain.
+    release(env, registered);
+    release(env, inserted);
+    release(env, deleted);
     // parent_context and merge_policy are weak / unretained
     env.objc.dealloc_object(this, &mut env.mem)
 }
@@ -736,11 +922,37 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (bool)hasChanges {
-    false
+    let host = env.objc.borrow::<NSManagedObjectContextHostObject>(this);
+    let (inserted, deleted) = (host.inserted_objects, host.deleted_objects);
+    let inserted_count: NSUInteger = msg![env; inserted count];
+    let deleted_count: NSUInteger = msg![env; deleted count];
+    inserted_count != 0 || deleted_count != 0
 }
 
-- (bool)save:(MutPtr<id>)_error {
-    log!("NSManagedObjectContext save: stubbed -> true");
+- (bool)save:(MutPtr<id>)error {
+    // Persistence is not implemented, so "saving" means accepting the changes
+    // into the context's snapshot: saved objects stop counting as inserted, so
+    // `-hasChanges` answers NO afterwards, as it does on a real context.
+    clear_error_out_parameter(env, error);
+    let host = env.objc.borrow::<NSManagedObjectContextHostObject>(this);
+    let (registered, inserted, deleted) = (
+        host.registered_objects,
+        host.inserted_objects,
+        host.deleted_objects,
+    );
+    let deleted_enumerator: id = msg![env; deleted objectEnumerator];
+    if deleted_enumerator != nil {
+        loop {
+            let object: id = msg![env; deleted_enumerator nextObject];
+            if object == nil {
+                break;
+            }
+            () = msg![env; registered removeObject:object];
+        }
+    }
+    () = msg![env; inserted removeAllObjects];
+    () = msg![env; deleted removeAllObjects];
+    log_dbg!("NSManagedObjectContext save: -> true (persistence is not implemented)");
     true
 }
 
@@ -786,12 +998,39 @@ pub const CLASSES: ClassExports = objc_classes! {
     nil
 }
 
-- (())insertObject:(id)_object { // NSManagedObject*
-    log!("NSManagedObjectContext insertObject: stubbed");
+- (())insertObject:(id)object { // NSManagedObject*
+    if object == nil {
+        return;
+    }
+    // Apple: an object inserted into a context is registered, retained by the
+    // context (the sets do the retaining) and counts as inserted until the
+    // next save.
+    let host = env.objc.borrow::<NSManagedObjectContextHostObject>(this);
+    let (registered, inserted, deleted) = (
+        host.registered_objects,
+        host.inserted_objects,
+        host.deleted_objects,
+    );
+    () = msg![env; registered addObject:object];
+    () = msg![env; inserted addObject:object];
+    () = msg![env; deleted removeObject:object];
 }
 
-- (())deleteObject:(id)_object { // NSManagedObject*
-    log!("NSManagedObjectContext deleteObject: stubbed");
+- (())deleteObject:(id)object { // NSManagedObject*
+    if object == nil {
+        return;
+    }
+    let host = env.objc.borrow::<NSManagedObjectContextHostObject>(this);
+    let (registered, inserted, deleted) = (
+        host.registered_objects,
+        host.inserted_objects,
+        host.deleted_objects,
+    );
+    // Register the deletion before dropping the context's reference, so the
+    // object cannot be deallocated mid-call.
+    () = msg![env; deleted addObject:object];
+    () = msg![env; inserted removeObject:object];
+    () = msg![env; registered removeObject:object];
 }
 
 - (())refreshObject:(id)_object mergeChanges:(bool)_merge {
@@ -810,28 +1049,40 @@ pub const CLASSES: ClassExports = objc_classes! {
     // Stub.
 }
 
-- (())performBlock:(id)_block {
-    log!("NSManagedObjectContext performBlock: stubbed (block not called)");
+- (())performBlock:(id)block { // void (^)(void)
+    // Core Data would run the block on the context's private queue. The
+    // emulator does not model Core Data queues, so the block runs here,
+    // synchronously. Not running it at all (the old behaviour) is a hang:
+    // start-up code that waits for the block's side effects (a flag, a
+    // semaphore, an object the block inserts) waits forever.
+    if block != nil {
+        call_void_block(env, block.cast_void());
+    }
 }
 
-- (())performBlockAndWait:(id)_block {
-    log!("NSManagedObjectContext performBlockAndWait: stubbed (block not called)");
+- (())performBlockAndWait:(id)block { // void (^)(void)
+    // "…AndWait" is defined as running the block and not returning until it
+    // has finished, so running it inline is exactly the documented behaviour.
+    if block != nil {
+        call_void_block(env, block.cast_void());
+    }
 }
 
 - (id)registeredObjects {
-    msg_class![env; NSSet new]
+    env.objc.borrow::<NSManagedObjectContextHostObject>(this).registered_objects
 }
 
 - (id)insertedObjects {
-    msg_class![env; NSSet new]
+    env.objc.borrow::<NSManagedObjectContextHostObject>(this).inserted_objects
 }
 
 - (id)updatedObjects {
+    // Nothing tracks updates yet, and there is no storage to compare against.
     msg_class![env; NSSet new]
 }
 
 - (id)deletedObjects {
-    msg_class![env; NSSet new]
+    env.objc.borrow::<NSManagedObjectContextHostObject>(this).deleted_objects
 }
 
 @end
@@ -931,30 +1182,64 @@ insertIntoManagedObjectContext:(id)context {           // NSManagedObjectContext
     let host_object = Box::new(NSEntityDescriptionHostObject {
         name: nil,
         managed_object_class_name: nil,
+        properties: nil,
         properties_by_name: props,
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
 
-+ (id)entityForName:(id)_name                       // NSString*
-    inManagedObjectContext:(id)_context {            // NSManagedObjectContext*
-    log!("NSEntityDescription entityForName: stubbed -> nil");
-    nil
+// Per Apple, `+entityForName:inManagedObjectContext:` returns the entity
+// registered in the context's model, or `nil` if the model has no such entity.
+// Returning `nil` unconditionally (the old behaviour) made every Core Data
+// client fail at start-up: Ghost Toasters asks for its entity, gets `nil`, and
+// never progresses past that point on the boot path.
++ (id)entityForName:(id)name                        // NSString*
+    inManagedObjectContext:(id)context {            // NSManagedObjectContext*
+    entity_named(env, name, context)
 }
 
-+ (id)insertNewObjectForEntityForName:(id)_name     // NSString*
-             inManagedObjectContext:(id)_context {  // NSManagedObjectContext*
-    log!("NSEntityDescription insertNewObjectForEntityForName: stubbed -> nil");
-    nil
++ (id)insertNewObjectForEntityForName:(id)name      // NSString*
+             inManagedObjectContext:(id)context {   // NSManagedObjectContext*
+    let entity = entity_named(env, name, context);
+    if entity == nil {
+        return nil;
+    }
+    // Apple: the new object is an instance of the entity's
+    // `managedObjectClassName` (a subclass of `NSManagedObject`, usually), and
+    // is inserted into the context as part of creation:
+    // `[[cls alloc] initWithEntity:entity insertIntoManagedObjectContext:ctx]`.
+    // A guest subclass inherits the host `+allocWithZone:`, so it gets the
+    // right host object; only fall back to `NSManagedObject` itself if the
+    // name does not resolve to a subclass (which would leave the object
+    // without the state these methods need).
+    let managed_object_class: Class = env.objc.get_known_class("NSManagedObject", &mut env.mem);
+    let mut object_class: Class = managed_object_class;
+    let class_name: id = msg![env; entity managedObjectClassName];
+    if class_name != nil {
+        let class_name = ns_string::to_rust_string(env, class_name).into_owned();
+        if !class_name.is_empty() {
+            if let Some(candidate) = env.objc.try_get_known_class(&class_name, &mut env.mem) {
+                if env.objc.class_is_subclass_of(candidate, managed_object_class) {
+                    object_class = candidate;
+                }
+            }
+        }
+    }
+    let object: id = msg![env; object_class alloc];
+    msg![env; object initWithEntity:entity insertIntoManagedObjectContext:context]
 }
 
 - (())dealloc {
     let host = env.objc.borrow::<NSEntityDescriptionHostObject>(this);
-    let (name, class_name, props) = (
-        host.name, host.managed_object_class_name, host.properties_by_name
+    let (name, class_name, properties, props) = (
+        host.name,
+        host.managed_object_class_name,
+        host.properties,
+        host.properties_by_name,
     );
     release(env, name);
     release(env, class_name);
+    release(env, properties);
     release(env, props);
     env.objc.dealloc_object(this, &mut env.mem)
 }
@@ -986,12 +1271,38 @@ insertIntoManagedObjectContext:(id)context {           // NSManagedObjectContext
 }
 
 - (id)properties {
-    let props = env.objc.borrow::<NSEntityDescriptionHostObject>(this).properties_by_name;
-    msg![env; props allValues]
+    // Apple declares `-properties` as returning an `NSArray` of property
+    // descriptions, so it is derived from the by-name index rather than
+    // echoing back whatever `-setProperties:` happened to receive. Like Core
+    // Data, the order is unspecified.
+    let by_name = env.objc.borrow::<NSEntityDescriptionHostObject>(this).properties_by_name;
+    msg![env; by_name allValues]
 }
 
-- (())setProperties:(id)_properties {
-    log!("NSEntityDescription setProperties: stubbed");
+- (())setProperties:(id)properties {
+    // Apple: "Sets the properties of the receiver." An app that builds its
+    // model in code calls this during start-up; dropping the properties (the
+    // old behaviour) left the entity empty and every property lookup failing.
+    let old = env.objc.borrow::<NSEntityDescriptionHostObject>(this).properties;
+    release(env, old);
+    retain(env, properties);
+    let index: id = msg_class![env; NSMutableDictionary new];
+    index_properties_by_name(env, properties, index);
+    let old_index = env.objc.borrow_mut::<NSEntityDescriptionHostObject>(this)
+        .properties_by_name;
+    release(env, old_index);
+    env.objc.borrow_mut::<NSEntityDescriptionHostObject>(this).properties = properties;
+    env.objc.borrow_mut::<NSEntityDescriptionHostObject>(this).properties_by_name = index;
+}
+
+- (id)attributesByName {
+    let by_name = env.objc.borrow::<NSEntityDescriptionHostObject>(this).properties_by_name;
+    properties_of_class(env, by_name, "NSAttributeDescription")
+}
+
+- (id)relationshipsByName {
+    let by_name = env.objc.borrow::<NSEntityDescriptionHostObject>(this).properties_by_name;
+    properties_of_class(env, by_name, "NSRelationshipDescription")
 }
 
 - (id)subentities   { msg_class![env; NSArray new] }
@@ -1229,6 +1540,7 @@ insertIntoManagedObjectContext:(id)context {           // NSManagedObjectContext
 
 + (id)allocWithZone:(NSZonePtr)_zone {
     let host_object = Box::new(NSAttributeDescriptionHostObject {
+        superclass: NSPropertyDescriptionHostObject::default(),
         attribute_type: 0, // NSUndefinedAttributeType
         default_value: nil,
         allows_external_binary_data_storage: false,
@@ -1237,8 +1549,17 @@ insertIntoManagedObjectContext:(id)context {           // NSManagedObjectContext
 }
 
 - (())dealloc {
-    let default_value = env.objc.borrow::<NSAttributeDescriptionHostObject>(this).default_value;
+    let host = env.objc.borrow::<NSAttributeDescriptionHostObject>(this);
+    let (default_value, name, user_info) = (
+        host.default_value,
+        host.superclass.name,
+        host.superclass.user_info,
+    );
     release(env, default_value);
+    // `-dealloc` of the superclass does not run by itself for host objects, so
+    // the embedded `NSPropertyDescription` state is released here.
+    release(env, name);
+    release(env, user_info);
     env.objc.dealloc_object(this, &mut env.mem)
 }
 

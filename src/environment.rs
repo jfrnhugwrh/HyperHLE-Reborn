@@ -1431,10 +1431,23 @@ impl Environment {
             return;
         }
         LAST_DUMP_MS.store(now, Ordering::Relaxed);
+        self.dump_all_thread_stacks(&format!("no frame presented for {} ms", since_present));
+    }
+
+    /// Dump the PC/LR/FP/SP of the running guest thread and the stack of every
+    /// active guest thread, so the log says *where* the app is stuck.
+    ///
+    /// Used by the `TOUCHHLE_STALL_DIAG` trace above and, more importantly, on
+    /// request from [crate::stall_watchdog]: the watchdog cannot read guest
+    /// memory or thread contexts itself (it runs on its own thread and must not
+    /// touch the [Environment], which may be exactly what is blocked), so it
+    /// asks for the dump to be taken here, on the scheduler's return-to-host
+    /// path, where a live `Environment` is guaranteed.
+    fn dump_all_thread_stacks(&self, reason: &str) {
         let regs = *self.cpu.regs();
         echo_no_panic!(
-            "STALL-DIAG no frame presented for {} ms; current thread #{} PC={:#x} LR={:#x} FP={:#x} SP={:#x}",
-            since_present,
+            "STALL-DIAG ({}): current thread #{} PC={:#x} LR={:#x} FP={:#x} SP={:#x}",
+            reason,
             self.current_thread,
             regs[cpu::Cpu::PC],
             regs[cpu::Cpu::LR],
@@ -2060,6 +2073,16 @@ impl Environment {
             // identified. Env-gated so it costs nothing in normal runs.
             if crate::env_flag_cached!("TOUCHHLE_STALL_DIAG") {
                 self.stall_diag();
+            }
+            // The stall watchdog may be about to report a hang and wants every
+            // thread's stack in the log first. It cannot take the dump itself,
+            // so it asks here; being on this path at all means some guest
+            // thread returned to the host, so this is usually serviced within
+            // microseconds. If nothing services it, the watchdog says so in its
+            // report, which means every guest thread is blocked in a host call.
+            if crate::stall_watchdog::take_dump_request() {
+                self.dump_all_thread_stacks("requested by the stall watchdog");
+                crate::stall_watchdog::note_dump_done();
             }
 
             if kill_current_thread && self.guest_termination_requested.is_some() {
@@ -3604,6 +3627,17 @@ impl Environment {
                                     );
                                 }
                             }
+                            // Mark the call as in flight for as long as this
+                            // block runs, so the stall watchdog can tell which
+                            // guest thread is blocked in which host function
+                            // (a thread that never returns is otherwise
+                            // invisible: the process-wide CPU counter keeps
+                            // moving, because the other threads still run).
+                            // See `crate::stall_watchdog`.
+                            let _host_call = crate::stall_watchdog::HostCallGuard::new(
+                                self.current_thread,
+                                svc_pc,
+                            );
                             f.call_from_guest(self);
 
                             let guest_control_flow_redirected =

@@ -74,6 +74,10 @@ int test_NSHashTable_copy_is_independent(void);
 int test_NSHashTable_copy_owns_members(void);
 int test_NSHashTable_copy_empty(void);
 int test_NSData_base64_data(void);
+int test_NSMutableURLRequest_keyed_archive_round_trip(void);
+int test_NSURLRequest_keyed_archive_round_trip(void);
+int test_NSURLRequest_keyed_archive_file_url(void);
+int test_NSURLRequest_keyed_archive_ownership(void);
 
 static int perform_selector_on_main_thread_calls;
 
@@ -7655,6 +7659,10 @@ struct {
     FUNC_DEF(test_NSHashTable_copy_owns_members),
     FUNC_DEF(test_NSHashTable_copy_empty),
     FUNC_DEF(test_NSData_base64_data),
+    FUNC_DEF(test_NSMutableURLRequest_keyed_archive_round_trip),
+    FUNC_DEF(test_NSURLRequest_keyed_archive_round_trip),
+    FUNC_DEF(test_NSURLRequest_keyed_archive_file_url),
+    FUNC_DEF(test_NSURLRequest_keyed_archive_ownership),
     FUNC_DEF(test_NSBundle_subbundleCacheRetainsAutoreleasedBundle),
 };
 // clang-format on

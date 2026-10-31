@@ -271,16 +271,19 @@ pub struct Options {
     pub dumping_options: DumpingOptions,
     pub dumping_file: PathBuf,
     pub ignore_gl_errors: bool,
-    /// Wrap every guest GL entry point with a `glGetError()` check after the
+    /// Wrap every guest GL entry point with a `glGetError()` check around the
     /// call and log the source location (in `gles_guest.rs`) of any non-zero
     /// error. Useful when an app silently misrenders (e.g. a black screen
     /// despite an alive render loop) because earlier calls are emitting
     /// `GL_INVALID_ENUM` / `GL_INVALID_VALUE` etc. that the app never polls
     /// for.
     ///
-    /// Note: enabling this changes guest-visible state because the host
-    /// `glGetError()` clears the error queue, so guest `glGetError()` calls
-    /// will see 0 instead of the real error. Diagnostic only.
+    /// The host's `glGetError()` is read-and-clear, so tracing queues every
+    /// error it drains on the raising context
+    /// ([crate::frameworks::opengles::State]) and the guest's own
+    /// `glGetError()` returns the queue first: the guest sees the same errors
+    /// with or without tracing. Errors drained by HyperHLE's internal GL code
+    /// (presenting, texture-upload pre-flight) are not covered.
     pub trace_gl_errors: bool,
     /// Log every GLES call made by the guest (via the LoggingGLES wrapper).
     /// Much noisier than `trace_gl_errors`. Diagnostic only.
@@ -295,22 +298,19 @@ pub struct Options {
     /// Gangstar's fragment-only varyings). Only meaningful on Android;
     /// ignored elsewhere.
     pub gles_native: bool,
-    /// After a `glTexImage2D(level=0, …)` upload, if the bound texture's
-    /// `GL_TEXTURE_MIN_FILTER` is still the ES 1.1 default
-    /// `GL_NEAREST_MIPMAP_LINEAR` (which makes the texture incomplete
-    /// because no mipmaps have been uploaded), force it to
-    /// `GL_LINEAR`. This mirrors the behaviour of lenient drivers like
-    /// Mesa and Apple's PowerVR ES 1.1 driver — strict drivers like
-    /// Qualcomm Adreno's native ES 1.1 driver instead sample
-    /// incomplete textures as opaque black, which produces a black
-    /// screen for games that never bother to set
-    /// `GL_TEXTURE_MIN_FILTER` themselves. The fix-up only fires for
-    /// `level == 0` uploads that find the default mipmap filter still
-    /// active; once the guest sets any non-default filter (mipmap or not)
-    /// we leave it alone, and any subsequent `glTexParameteri(GL_TEXTURE_MIN_FILTER, …)`
-    /// from the guest will override our `GL_LINEAR` write. Multi-level uploads
-    /// (`level > 0`) do not trigger the fix-up so games that actually use
-    /// mipmaps are unaffected.
+    /// Android default: on. Compensates for strict native OpenGL ES 1.1
+    /// drivers (Mali, Adreno) that sample a mipmap-incomplete texture as
+    /// black, where iOS-era games relied on lenient PowerVR behaviour. The
+    /// guest's requested `GL_TEXTURE_MIN_FILTER` is recorded per texture and
+    /// `glGetTexParameter*` keeps reporting it; the host driver is given the
+    /// guest's filter once the texture has mip levels, and otherwise the
+    /// nearest non-mipmap filter (`GL_LINEAR` if the guest never set one). A
+    /// non-mipmap filter chosen by the guest is never changed.
+    ///
+    /// Acts on native OpenGL ES 1.x contexts only: ES 2.0 contexts (ANGLE,
+    /// iOS) already sample incomplete textures as black, so substituting
+    /// there would only hide guest bugs and degrade mipmapped textures. See
+    /// `frameworks/opengles/min_filter.rs`.
     pub fix_texture_min_filter: bool,
     pub zero_stack_after_guest_to_host_call: Option<u32>,
     /// device (FMOD streaming bypass). Opt in with `--fix-music` or

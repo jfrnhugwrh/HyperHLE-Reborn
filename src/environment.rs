@@ -473,6 +473,9 @@ impl Environment {
         app_args: Vec<String>,
     ) -> Result<Environment, String> {
         let startup_time = Instant::now();
+        // A new app session: the stall watchdog must not blame this app for
+        // a quiet period that belonged to the picker or a previous app.
+        crate::stall_watchdog::begin_session();
         let launched_bundle_id = bundle.bundle_identifier().to_owned();
 
         if launched_bundle_id == "at.source.potato.full" {

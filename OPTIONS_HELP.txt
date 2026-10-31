@@ -347,23 +347,30 @@ Other options:
         app-specific options file.
 
     --present-mode=...
-        How a frame that an app rendered into a fullscreen EAGL layer is put
-        on the screen. One of:
+        How a frame that an app rendered into an EAGL layer is put on the
+        screen. One of:
 
         'auto' (default): present on the GPU (the renderbuffer is copied to a
         texture and drawn into the window). If the first frames come out
         black while the renderbuffer clearly has content, HyperHLE assumes the
         host driver mishandles this path and switches to 'readback' for the
-        rest of the session (a message is logged).
+        rest of the session (a message is logged). Native OpenGL ES 1.1
+        backends use 'readback' by default.
 
-        'direct': always present on the GPU, never fall back.
+        'direct': always present on the GPU, never fall back. On an OpenGL ES
+        2.0 backend this also applies when no layer was recognized as
+        fullscreen: the drawable the app just presented is copied to the
+        window as it is. The startup log line "EAGL presenter: ..." says
+        whether a fullscreen layer was found and what selected the presenter.
 
         'readback': read the frame back to system RAM with glReadPixels()
         and push it through the compositor, like older versions did on
         Android. This is much slower (a full GPU pipeline stall and two
         full-frame copies per frame), but it never touches the app's GL state,
         which makes it a useful workaround for buggy vendor OpenGL ES 1.1
-        drivers.
+        drivers. It is not available on a real OpenGL ES 2.0 backend (the
+        readback path uses ES 1.1 entry points): there the request is logged
+        and the frame is presented on the GPU instead.
 
         The environment variable TOUCHHLE_PRESENT_MODE accepts the same
         values; the option takes precedence over it.
@@ -474,14 +481,18 @@ Other options:
 
     --trace-gl-errors
     --no-trace-gl-errors
-        For diagnostic builds. After every guest GL call dispatched through
-        the GLES wrapper, also log the host driver's glGetError() value when
-        non-zero. The log line includes the name of the offending entry
-        point so that constant 0x500 (GL_INVALID_ENUM) / 0x501
+        For diagnostic builds. Around every guest GL call dispatched through
+        the GLES wrapper, drain the host driver's error flags and log each
+        non-zero value together with the source location of the entry point
+        that raised it, so that constant 0x500 (GL_INVALID_ENUM) / 0x501
         (GL_INVALID_VALUE) noise can be traced back to a specific call.
-        This option exists for debugging black-screen / wrong-render bugs
-        and adds a glGetError() round-trip per call, so it should not be
-        left on for normal use.
+
+        Errors are only observed, not consumed: each one is queued for the
+        context that raised it and returned by the app's own glGetError(), so
+        the app sees the same errors with or without this option. Errors that
+        HyperHLE's own internal GL code drains (for example while presenting a
+        frame) are not covered. This adds a glGetError() round-trip per call,
+        so it should not be left on for normal use.
 
     --gles-native / --no-gles-native
         Android only. OFF by default (and exposed as the "GLES Native" switch
@@ -493,27 +504,33 @@ Other options:
         Gangstar), but it differs a lot between devices, so it is opt-in.
 
     --fix-texture-min-filter
-        Workaround for apps that rely on the default ES 1.1
-        GL_TEXTURE_MIN_FILTER (GL_NEAREST_MIPMAP_LINEAR) being usable
-        on a level-0-only texture. With this flag, after every
-        glTexImage2D(level=0) call HyperHLE issues an extra
-        glTexParameteri(GL_TEXTURE_MIN_FILTER, GL_LINEAR) so that
-        strict drivers (notably Qualcomm Adreno's native ES 1.1 path)
-        don't sample the texture as opaque black just because no
-        mipmaps were uploaded. The guest's own glTexParameteri calls
-        still override this. Apps that legitimately upload mipmaps
-        should NOT enable this flag.
+        Workaround for native OpenGL ES 1.x apps that rely on the default
+        GL_TEXTURE_MIN_FILTER (GL_NEAREST_MIPMAP_LINEAR) being usable on a
+        texture that only has level 0. On strict drivers (notably Qualcomm
+        Adreno's and ARM Mali's native ES 1.1 paths) such a texture is
+        incomplete and is sampled as opaque black.
 
-        On Android builds this workaround is enabled by default, because
-        Android hosts essentially always run Mali / Adreno / similar
-        strict drivers. On desktop hosts it stays off so pixel output is
-        unchanged for the common case.
+        With this flag, HyperHLE remembers the min filter each texture was
+        given by the app, and gives the driver:
+          - the app's own filter, whenever the texture has mip levels (any
+            level above 0 uploaded, or glGenerateMipmap called);
+          - otherwise the nearest non-mipmap filter (GL_LINEAR if the app
+            never set one; GL_NEAREST or GL_LINEAR for an explicit mipmap
+            filter).
+        A non-mipmap filter chosen by the app is never changed, and
+        glGetTexParameter still reports the app's own value.
+
+        It only acts on OpenGL ES 1.x contexts. OpenGL ES 2.0 contexts are
+        never touched: ANGLE and iOS both sample an incomplete texture as
+        black there, so a game that depends on it is relying on a bug.
+
+        On Android builds this is enabled by default. On desktop hosts it
+        stays off so pixel output is unchanged for the common case.
 
     --no-fix-texture-min-filter
         Explicitly disable the fix_texture_min_filter workaround described
-        above. Useful on Android (where it is on by default) for the rare
-        iOS title that legitimately relies on mipmap minification and
-        would visibly lose quality under the forced GL_LINEAR.
+        above, e.g. for a native ES 1.1 app on Android that has no mipmaps
+        but relies on exact driver behaviour.
 
     --zero-stack-after-guest-to-host-call=<bytes>
         After a guest-to-host call returns, zero out the given number of

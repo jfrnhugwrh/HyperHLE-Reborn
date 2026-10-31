@@ -11,6 +11,7 @@
 
 mod eagl;
 mod gles_guest;
+mod min_filter;
 mod software_vao;
 
 use touchHLE_gl_bindings::gles11::types::{GLenum, GLint, GLsizei, GLuint};
@@ -61,6 +62,42 @@ pub struct State {
     /// cannot be decided when `glViewport` is called — we remember the request
     /// and re-apply it with the right scaling whenever the binding changes.
     guest_viewports: std::collections::HashMap<crate::ThreadId, (GLint, GLint, GLsizei, GLsizei)>,
+    /// GL error flags that a diagnostic check (`--trace-gl-errors`) drained
+    /// from the host driver but that the guest has not yet seen, keyed by
+    /// EAGLContext address, oldest first.
+    ///
+    /// Tracing must not change what the guest observes: the driver's error
+    /// flags are read-and-clear, so a diagnostic `glGetError()` would
+    /// otherwise swallow errors before the app's own `glGetError()` runs.
+    /// Errors are queued here instead and handed back by the guest-facing
+    /// `glGetError`, one per call as GL specifies. Each context has its own
+    /// queue, since error flags are per context.
+    pending_gl_errors: std::collections::HashMap<u32, std::collections::VecDeque<GLenum>>,
+}
+/// Upper bound on queued errors per context, so a driver that keeps raising
+/// errors cannot grow memory without limit.
+const MAX_PENDING_GL_ERRORS: usize = 64;
+
+impl State {
+    /// Queue an error a diagnostic check took from the driver (see
+    /// [State::pending_gl_errors]).
+    pub fn stash_gl_error(&mut self, context: u32, error: GLenum) {
+        let queue = self.pending_gl_errors.entry(context).or_default();
+        if queue.len() < MAX_PENDING_GL_ERRORS {
+            queue.push_back(error);
+        }
+    }
+
+    /// The oldest queued error for `context`, if any. The guest-facing
+    /// `glGetError` consults this before the driver.
+    pub fn take_stashed_gl_error(&mut self, context: u32) -> Option<GLenum> {
+        self.pending_gl_errors.get_mut(&context)?.pop_front()
+    }
+
+    /// Drop everything queued for a context that no longer exists.
+    pub fn forget_context_gl_errors(&mut self, context: u32) {
+        self.pending_gl_errors.remove(&context);
+    }
 }
 impl State {
     fn current_ctx_for_thread(&mut self, thread: crate::ThreadId) -> &mut Option<crate::objc::id> {
@@ -166,4 +203,52 @@ fn get_thread_context<'objc>(
     let gles_ctx: &mut (dyn crate::gles::GLESContext + 'static) =
         host_obj.gles_ctx.as_deref_mut()?;
     Some(gles_ctx as &mut dyn crate::gles::GLESContext)
+}
+
+#[cfg(test)]
+mod gl_error_queue_tests {
+    use super::*;
+
+    const INVALID_ENUM: GLenum = 0x500;
+    const INVALID_VALUE: GLenum = 0x501;
+
+    #[test]
+    fn stashed_errors_are_served_oldest_first_one_per_call() {
+        let mut state = State::default();
+        state.stash_gl_error(1, INVALID_ENUM);
+        state.stash_gl_error(1, INVALID_VALUE);
+        assert_eq!(state.take_stashed_gl_error(1), Some(INVALID_ENUM));
+        assert_eq!(state.take_stashed_gl_error(1), Some(INVALID_VALUE));
+        assert_eq!(state.take_stashed_gl_error(1), None);
+    }
+
+    #[test]
+    fn error_queues_are_per_context() {
+        let mut state = State::default();
+        state.stash_gl_error(1, INVALID_ENUM);
+        // Another context must not observe context 1's error.
+        assert_eq!(state.take_stashed_gl_error(2), None);
+        assert_eq!(state.take_stashed_gl_error(1), Some(INVALID_ENUM));
+    }
+
+    #[test]
+    fn forgetting_a_context_drops_its_errors() {
+        let mut state = State::default();
+        state.stash_gl_error(7, INVALID_ENUM);
+        state.forget_context_gl_errors(7);
+        assert_eq!(state.take_stashed_gl_error(7), None);
+    }
+
+    #[test]
+    fn the_queue_is_bounded() {
+        let mut state = State::default();
+        for _ in 0..(MAX_PENDING_GL_ERRORS * 3) {
+            state.stash_gl_error(1, INVALID_ENUM);
+        }
+        let mut n = 0;
+        while state.take_stashed_gl_error(1).is_some() {
+            n += 1;
+        }
+        assert_eq!(n, MAX_PENDING_GL_ERRORS);
+    }
 }

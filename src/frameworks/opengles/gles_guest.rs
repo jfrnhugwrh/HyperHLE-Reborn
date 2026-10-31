@@ -91,6 +91,62 @@ fn pvrtc_subimage_matches_level(
     )
 }
 
+/// Take every error flag the host driver currently holds. Bounded, so a
+/// driver that raises errors forever cannot hang the emulator.
+unsafe fn take_host_gl_errors(gles: &mut dyn GLES) -> Vec<GLenum> {
+    let mut errors = Vec::new();
+    for _ in 0..16 {
+        let err = gles.GetError();
+        if err == 0 {
+            break;
+        }
+        errors.push(err);
+    }
+    errors
+}
+
+/// `--trace-gl-errors`, before a guest call: anything the driver already holds
+/// was raised before this call and is still owed to the guest, so queue it
+/// rather than discard it. This also makes the post-call check attribute only
+/// this call's own errors to it.
+fn trace_stash_pending_errors(
+    state: &mut super::State,
+    context: Option<u32>,
+    gles: &mut dyn GLES,
+) {
+    let errors = unsafe { take_host_gl_errors(gles) };
+    if let Some(context) = context {
+        for err in errors {
+            state.stash_gl_error(context, err);
+        }
+    }
+}
+
+/// `--trace-gl-errors`, after a guest call: report each error this call
+/// raised, then queue it for the guest instead of consuming it, so the app's
+/// own `glGetError()` still observes it.
+fn trace_report_and_stash_errors(
+    state: &mut super::State,
+    context: Option<u32>,
+    gles: &mut dyn GLES,
+    caller: &std::panic::Location<'_>,
+) {
+    let errors = unsafe { take_host_gl_errors(gles) };
+    for err in errors {
+        log!(
+            "[--trace-gl-errors] {} call reported glGetError() = {:#x} \
+             dispatched from {}:{}",
+            gles.diagnostic_profile(),
+            err,
+            caller.file(),
+            caller.line()
+        );
+        if let Some(context) = context {
+            state.stash_gl_error(context, err);
+        }
+    }
+}
+
 #[track_caller]
 fn with_ctx_and_mem<T, U: Default>(env: &mut Environment, f: T) -> U
 where
@@ -130,30 +186,29 @@ where
         );
         return U::default();
     };
-    // Clear any sticky host-GL error before the call so that the post-call
-    // trace report only reflects errors raised by *this* dispatch, not
-    // leftovers from untraced internal code paths (EAGL present, context
-    // sync, etc.). Without this, one bad call makes every later traced
-    // call report the same code at the wrong line.
+    // Under --trace-gl-errors, drain the driver's error flags around the call
+    // to attribute errors to it, but queue them for the guest instead of
+    // discarding them (see State::pending_gl_errors): tracing must not change
+    // what the app's own glGetError() observes.
+    let ctx_key = (*env
+        .framework_state
+        .opengles
+        .current_ctx_for_thread(env.current_thread))
+    .map(|ctx| ctx.to_bits());
     if trace {
-        unsafe { gles.GetError() };
+        trace_stash_pending_errors(&mut env.framework_state.opengles, ctx_key, gles.as_mut());
     }
     let res = {
         let _guest_call_guard = GuestGlesCallGuard::enter();
         f(gles.as_mut(), &mut env.mem)
     };
     if trace {
-        let err = unsafe { gles.GetError() };
-        if err != 0 {
-            log!(
-                "[--trace-gl-errors] {} call reported glGetError() = {:#x} \
-                 dispatched from {}:{}",
-                gles.diagnostic_profile(),
-                err,
-                caller.file(),
-                caller.line()
-            );
-        }
+        trace_report_and_stash_errors(
+            &mut env.framework_state.opengles,
+            ctx_key,
+            gles.as_mut(),
+            caller,
+        );
     }
     #[allow(clippy::let_and_return)]
     res
@@ -197,25 +252,22 @@ where
         return U::default();
     };
     let mut gles = gles_ctx.make_current(window);
+    // See with_ctx_and_mem: queue, don't discard, errors drained for tracing.
+    let ctx_key = Some(current_ctx.to_bits());
     if trace {
-        unsafe { gles.GetError() };
+        trace_stash_pending_errors(&mut env.framework_state.opengles, ctx_key, gles.as_mut());
     }
     let res = {
         let _guest_call_guard = GuestGlesCallGuard::enter();
         f(gles.as_mut(), &mut env.mem, shadow)
     };
     if trace {
-        let err = unsafe { gles.GetError() };
-        if err != 0 {
-            log!(
-                "[--trace-gl-errors] {} call reported glGetError() = {:#x} \
-                 dispatched from {}:{}",
-                gles.diagnostic_profile(),
-                err,
-                caller.file(),
-                caller.line()
-            );
-        }
+        trace_report_and_stash_errors(
+            &mut env.framework_state.opengles,
+            ctx_key,
+            gles.as_mut(),
+            caller,
+        );
     }
     #[allow(clippy::let_and_return)]
     res
@@ -252,22 +304,25 @@ where
         );
         return U::default();
     };
+    let ctx_key = (*env
+        .framework_state
+        .opengles
+        .current_ctx_for_thread(env.current_thread))
+    .map(|ctx| ctx.to_bits());
+    if trace {
+        trace_stash_pending_errors(&mut env.framework_state.opengles, ctx_key, gles.as_mut());
+    }
     let res = {
         let _guest_call_guard = GuestGlesCallGuard::enter();
         f(gles.as_mut(), &mut env.mem)
     };
     if trace {
-        let err = unsafe { gles.GetError() };
-        if err != 0 {
-            log!(
-                "[--trace-gl-errors] {} call reported glGetError() = {:#x} \
-                 dispatched from {}:{}",
-                gles.diagnostic_profile(),
-                err,
-                caller.file(),
-                caller.line()
-            );
-        }
+        trace_report_and_stash_errors(
+            &mut env.framework_state.opengles,
+            ctx_key,
+            gles.as_mut(),
+            caller,
+        );
     }
     #[allow(clippy::let_and_return)]
     res
@@ -275,8 +330,22 @@ where
 
 fn glGetError(env: &mut Environment) -> GLenum {
     let ignore_gl_errors = env.options.ignore_gl_errors;
+    // Errors that --trace-gl-errors drained for diagnosis are still owed to the
+    // guest; serve them before asking the driver (per context, oldest first).
+    let current_ctx = *env
+        .framework_state
+        .opengles
+        .current_ctx_for_thread(env.current_thread);
+    let stashed = current_ctx.and_then(|ctx| {
+        env.framework_state
+            .opengles
+            .take_stashed_gl_error(ctx.to_bits())
+    });
     with_ctx_and_mem(env, |gles, _mem| {
-        let err = unsafe { gles.GetError() };
+        let err = match stashed {
+            Some(err) => err,
+            None => unsafe { gles.GetError() },
+        };
         if err != 0 {
             if ignore_gl_errors {
                 return 0;
@@ -1394,6 +1463,10 @@ fn glGetTexParameteriv(
     pname: GLenum,
     params: MutPtr<GLint>,
 ) {
+    if let Some(filter) = tracked_guest_min_filter(env, target, pname) {
+        env.mem.write(params, filter as GLint);
+        return;
+    }
     with_ctx_and_mem(env, |gles, mem| {
         let params = mem.ptr_at_mut(params, 1);
         unsafe { gles.GetTexParameteriv(target, pname, params) }
@@ -1405,6 +1478,10 @@ fn glGetTexParameterfv(
     pname: GLenum,
     params: MutPtr<GLfloat>,
 ) {
+    if let Some(filter) = tracked_guest_min_filter(env, target, pname) {
+        env.mem.write(params, filter as GLfloat);
+        return;
+    }
     with_ctx_and_mem(env, |gles, mem| {
         let params = mem.ptr_at_mut(params, 1);
         unsafe { gles.GetTexParameterfv(target, pname, params) }
@@ -1416,6 +1493,10 @@ fn glGetTexParameterxv(
     pname: GLenum,
     params: MutPtr<GLfixed>,
 ) {
+    if let Some(filter) = tracked_guest_min_filter(env, target, pname) {
+        env.mem.write(params, filter as GLfixed);
+        return;
+    }
     with_ctx_and_mem(env, |gles, mem| {
         let params = mem.ptr_at_mut(params, 1);
         unsafe { gles.GetTexParameterxv(target, pname, params) }
@@ -2744,6 +2825,7 @@ fn glDeleteTextures(env: &mut Environment, n: GLsizei, textures: ConstPtr<GLuint
         unsafe { gles.DeleteTextures(n, deleted.as_ptr()) };
         for texture in deleted {
             shadow.forget_pvrtc_texture(texture);
+            shadow.min_filters.forget(texture);
         }
     })
 }
@@ -2771,47 +2853,126 @@ fn glBindTexture(env: &mut Environment, target: GLenum, texture: GLuint) {
         gles.BindTexture(target, texture)
     })
 }
-/// If `pname` is `GL_TEXTURE_MIN_FILTER` and `param` is a mipmap min-filter
-/// (e.g. `GL_NEAREST_MIPMAP_LINEAR`), return the closest non-mipmap value
-/// (`GL_NEAREST` or `GL_LINEAR`). Otherwise return `param` unchanged.
-///
-/// On strict ES 1.1 drivers (notably ARM Mali r32p1) a texture that only had
-/// level 0 uploaded becomes "incomplete" the moment the guest sets a mipmap
-/// min-filter, and sampling such a texture returns black — which made the
-/// LEGO Ninjago title menu render as a uniform-black quad on Mali-G57 MC2,
-/// even though the LEGO splash logo (whose textures kept the touchHLE-forced
-/// GL_LINEAR override from glTexImage2D) rendered fine.
-fn demipmap_filter_value(pname: GLenum, param: GLint) -> GLint {
-    if pname != gles11::TEXTURE_MIN_FILTER {
-        return param;
+/// Whether `--fix-texture-min-filter` should act for the current context:
+/// the option is on and the context is a native OpenGL ES 1.x one. See
+/// [super::min_filter] for why ES 2.0 contexts are left alone.
+fn min_filter_fix_active(env: &mut Environment) -> bool {
+    let enabled = env.options.fix_texture_min_filter;
+    if !enabled {
+        return false;
     }
-    let p = param as GLenum;
-    let demipmapped = match p {
-        gles11::NEAREST_MIPMAP_NEAREST | gles11::NEAREST_MIPMAP_LINEAR => gles11::NEAREST,
-        gles11::LINEAR_MIPMAP_NEAREST | gles11::LINEAR_MIPMAP_LINEAR => gles11::LINEAR,
-        _ => return param,
-    };
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static SEEN: AtomicBool = AtomicBool::new(false);
-    if !SEEN.swap(true, Ordering::Relaxed) {
-        log!(
-            "First fix_texture_min_filter override: substituting guest's \
-             glTexParameter(GL_TEXTURE_MIN_FILTER, 0x{:x}) with 0x{:x} \
-             (mipmap modes leave the texture incomplete on strict ES 1.1 \
-             drivers like Mali r32p1, which then samples them as black) \
-             [this log will only be shown once]",
-            p,
-            demipmapped
-        );
-    }
-    demipmapped as GLint
+    let ctx = *env
+        .framework_state
+        .opengles
+        .current_ctx_for_thread(env.current_thread);
+    let is_es1 = ctx.is_some_and(|ctx| env.objc.borrow::<EAGLContextHostObject>(ctx).is_es1());
+    super::min_filter::workaround_applies(enabled, is_es1)
 }
 
-fn maybe_demipmap_min_filter(env: &Environment, pname: GLenum, param: GLint) -> GLint {
-    if !env.options.fix_texture_min_filter {
-        return param;
+/// Record a guest write of `GL_TEXTURE_MIN_FILTER` for the bound texture and
+/// give the host driver the matching effective filter.
+fn set_tracked_min_filter(
+    gles: &mut dyn GLES,
+    shadow: &mut GLShadowState,
+    target: GLenum,
+    guest: GLenum,
+) {
+    let host = match unsafe { current_bound_texture(gles, target) } {
+        Some(texture) => shadow.min_filters.set_guest_filter(texture, guest),
+        None => guest,
+    };
+    unsafe {
+        gles.TexParameteri(
+            target,
+            gles11::TEXTURE_MIN_FILTER,
+            super::min_filter::as_param(host),
+        )
+    };
+}
+
+/// After an image was specified for `level` of the bound texture, refresh the
+/// host filter. Only `GL_TEXTURE_2D` is handled: cube-map face enums are not
+/// valid `glTexParameter` targets.
+fn note_upload_for_min_filter(
+    gles: &mut dyn GLES,
+    shadow: &mut GLShadowState,
+    target: GLenum,
+    bound_texture: Option<GLuint>,
+    level: GLint,
+    width: GLsizei,
+    height: GLsizei,
+) {
+    let Some(texture) = bound_texture else {
+        return;
+    };
+    if target != gles11::TEXTURE_2D {
+        return;
     }
-    demipmap_filter_value(pname, param)
+    let host = shadow
+        .min_filters
+        .note_level_uploaded(texture, level, width, height);
+    unsafe {
+        gles.TexParameteri(
+            target,
+            gles11::TEXTURE_MIN_FILTER,
+            super::min_filter::as_param(host),
+        )
+    };
+}
+
+/// Like [note_upload_for_min_filter], after `glGenerateMipmap`.
+fn note_mipmaps_for_min_filter(gles: &mut dyn GLES, shadow: &mut GLShadowState, target: GLenum) {
+    if target != gles11::TEXTURE_2D {
+        return;
+    }
+    let Some(texture) = (unsafe { current_bound_texture(gles, target) }) else {
+        return;
+    };
+    let host = shadow.min_filters.note_mipmaps_generated(texture);
+    unsafe {
+        gles.TexParameteri(
+            target,
+            gles11::TEXTURE_MIN_FILTER,
+            super::min_filter::as_param(host),
+        )
+    };
+}
+
+/// Handle `glTexParameter*(GL_TEXTURE_MIN_FILTER, …)` under the workaround.
+/// Returns `false` (and does nothing) when the workaround does not apply, so
+/// the caller forwards the call untouched.
+fn try_tracked_min_filter(
+    env: &mut Environment,
+    target: GLenum,
+    pname: GLenum,
+    read_value: impl FnOnce(&mut Mem) -> GLenum,
+) -> bool {
+    if pname != gles11::TEXTURE_MIN_FILTER
+        || target != gles11::TEXTURE_2D
+        || !min_filter_fix_active(env)
+    {
+        return false;
+    }
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| {
+        let guest = read_value(mem);
+        set_tracked_min_filter(gles, shadow, target, guest);
+    });
+    true
+}
+
+/// The filter the guest believes the bound texture has, when the workaround
+/// is tracking it (the host's value may differ), so queries stay truthful.
+fn tracked_guest_min_filter(env: &mut Environment, target: GLenum, pname: GLenum) -> Option<GLenum> {
+    if pname != gles11::TEXTURE_MIN_FILTER
+        || target != gles11::TEXTURE_2D
+        || !min_filter_fix_active(env)
+    {
+        return None;
+    }
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| {
+        unsafe { current_bound_texture(gles, target) }
+            .map(|texture| shadow.min_filters.guest_filter(texture))
+    })
 }
 
 fn glTexParameteri(env: &mut Environment, target: GLenum, pname: GLenum, param: GLint) {
@@ -2828,7 +2989,9 @@ fn glTexParameteri(env: &mut Environment, target: GLenum, pname: GLenum, param: 
     if pname == gles11::TEXTURE_CROP_RECT_OES {
         return;
     }
-    let param = maybe_demipmap_min_filter(env, pname, param);
+    if try_tracked_min_filter(env, target, pname, |_| param as GLenum) {
+        return;
+    }
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.TexParameteri(target, pname, param)
     })
@@ -2837,9 +3000,10 @@ fn glTexParameterf(env: &mut Environment, target: GLenum, pname: GLenum, param: 
     if pname == gles11::TEXTURE_CROP_RECT_OES {
         return;
     }
-    // Floats can also be used to pass enum-valued min-filter params (an
-    // OpenGL quirk), so route them through the same substitution.
-    let param = maybe_demipmap_min_filter(env, pname, param as GLint) as GLfloat;
+    // Floats can also pass enum-valued min-filter params (an OpenGL quirk).
+    if try_tracked_min_filter(env, target, pname, |_| param as GLenum) {
+        return;
+    }
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.TexParameterf(target, pname, param)
     })
@@ -2848,8 +3012,10 @@ fn glTexParameterx(env: &mut Environment, target: GLenum, pname: GLenum, param: 
     if pname == gles11::TEXTURE_CROP_RECT_OES {
         return;
     }
-    // Fixed-point can also encode enum values; route through substitution.
-    let param = maybe_demipmap_min_filter(env, pname, param) as GLfixed;
+    // Fixed-point can also encode enum values.
+    if try_tracked_min_filter(env, target, pname, |_| param as GLenum) {
+        return;
+    }
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.TexParameterx(target, pname, param)
     })
@@ -2880,18 +3046,13 @@ fn glTexParameteriv(env: &mut Environment, target: GLenum, pname: GLenum, params
         });
         return;
     }
-    let fix_min_filter = env.options.fix_texture_min_filter && pname == gles11::TEXTURE_MIN_FILTER;
+    if try_tracked_min_filter(env, target, pname, |mem| unsafe {
+        *mem.ptr_at(params, 1) as GLenum
+    }) {
+        return;
+    }
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let params_ptr = mem.ptr_at(params, 1);
-        if fix_min_filter {
-            let original: GLint = *params_ptr;
-            let substituted = demipmap_filter_value(pname, original);
-            if substituted != original {
-                let v = [substituted];
-                gles.TexParameteriv(target, pname, v.as_ptr());
-                return;
-            }
-        }
         gles.TexParameteriv(target, pname, params_ptr)
     })
 }
@@ -2926,18 +3087,13 @@ fn glTexParameterfv(
         });
         return;
     }
-    let fix_min_filter = env.options.fix_texture_min_filter && pname == gles11::TEXTURE_MIN_FILTER;
+    if try_tracked_min_filter(env, target, pname, |mem| unsafe {
+        *mem.ptr_at(params, 1) as GLenum
+    }) {
+        return;
+    }
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let params_ptr = mem.ptr_at(params, 1);
-        if fix_min_filter {
-            let original: GLfloat = *params_ptr;
-            let substituted = demipmap_filter_value(pname, original as GLint) as GLfloat;
-            if substituted != original {
-                let v = [substituted];
-                gles.TexParameterfv(target, pname, v.as_ptr());
-                return;
-            }
-        }
         gles.TexParameterfv(target, pname, params_ptr)
     })
 }
@@ -2972,18 +3128,13 @@ fn glTexParameterxv(
         });
         return;
     }
-    let fix_min_filter = env.options.fix_texture_min_filter && pname == gles11::TEXTURE_MIN_FILTER;
+    if try_tracked_min_filter(env, target, pname, |mem| unsafe {
+        *mem.ptr_at(params, 1) as GLenum
+    }) {
+        return;
+    }
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let params_ptr = mem.ptr_at(params, 1);
-        if fix_min_filter {
-            let original: GLfixed = *params_ptr;
-            let substituted = demipmap_filter_value(pname, original) as GLfixed;
-            if substituted != original {
-                let v = [substituted];
-                gles.TexParameterxv(target, pname, v.as_ptr());
-                return;
-            }
-        }
         gles.TexParameterxv(target, pname, params_ptr)
     })
 }
@@ -3064,7 +3215,7 @@ fn glTexImage2D(
         }
     }
     let guest_pixels = pixels;
-    let fix_filter = env.options.fix_texture_min_filter && level == 0;
+    let fix_filter = min_filter_fix_active(env);
     with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
         let bound_texture = current_bound_texture(gles, target);
         let pixels = if pixels.is_null() {
@@ -3117,20 +3268,21 @@ fn glTexImage2D(
             }
         }
         if fix_filter {
-            // Set GL_TEXTURE_MIN_FILTER to GL_LINEAR for the bound
-            // texture so it isn't sampled as opaque black on strict
-            // ES 1.1 drivers (notably Qualcomm Adreno) just because
-            // the guest never bothered to override the default
-            // GL_NEAREST_MIPMAP_LINEAR. The guest's own
-            // glTexParameteri(GL_TEXTURE_MIN_FILTER, …) will override
-            // this on subsequent calls — see Options::fix_texture_min_filter.
+            // Refresh the host's min filter from the tracked guest state (see
+            // super::min_filter): a level-0-only texture whose filter is a
+            // mipmap mode (or was never set) is sampled non-mipmapped so it is
+            // not black on strict native ES 1.1 drivers, but a filter the
+            // guest chose is never overwritten, and a texture with mip
+            // levels keeps its mipmap filter.
             static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 log!(
-                    "First fix_texture_min_filter override: forcing GL_TEXTURE_MIN_FILTER=GL_LINEAR after glTexImage2D(level=0) [this log will only be shown once]"
+                    "fix_texture_min_filter active for this native ES 1.x context: \
+                     host min filter is derived from the guest's filter and the \
+                     texture's mip levels [this log will only be shown once]"
                 );
             }
-            gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
+            note_upload_for_min_filter(gles, shadow, target, bound_texture, level, width, height);
         }
     })
 }
@@ -3182,7 +3334,7 @@ fn glCompressedTexImage2D(
             target, level, internalformat, width, height, border, image_size, data.to_bits()
         );
     }
-    let fix_filter = env.options.fix_texture_min_filter && level == 0;
+    let fix_filter = min_filter_fix_active(env);
     with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
         let bound_texture = current_bound_texture(gles, target);
         if let Some(texture) = bound_texture {
@@ -3274,7 +3426,7 @@ fn glCompressedTexImage2D(
                 }
             }
             if fix_filter {
-                gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
+                note_upload_for_min_filter(gles, shadow, target, bound_texture, level, width, height);
             }
             return;
         }
@@ -3308,7 +3460,7 @@ fn glCompressedTexImage2D(
                     }
                 }
                 if fix_filter {
-                    gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
+                    note_upload_for_min_filter(gles, shadow, target, bound_texture, level, width, height);
                 }
                 return;
             }
@@ -3375,7 +3527,7 @@ fn glCompressedTexImage2D(
         }
 
         if fix_filter {
-            gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, gles11::LINEAR as GLint);
+            note_upload_for_min_filter(gles, shadow, target, bound_texture, level, width, height);
         }
     })
 }
@@ -3390,11 +3542,15 @@ fn glCopyTexImage2D(
     height: GLsizei,
     border: GLint,
 ) {
+    let fix_filter = min_filter_fix_active(env);
     with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
         let bound_texture = current_bound_texture(gles, target);
         gles.CopyTexImage2D(target, level, internalformat, x, y, width, height, border);
         if let Some(texture) = bound_texture {
             shadow.forget_pvrtc_texture_level(target, texture, level);
+        }
+        if fix_filter {
+            note_upload_for_min_filter(gles, shadow, target, bound_texture, level, width, height);
         }
     })
 }
@@ -3731,7 +3887,13 @@ fn glDeleteRenderbuffersOES(env: &mut Environment, n: GLsizei, renderbuffers: Co
     })
 }
 fn glGenerateMipmapOES(env: &mut Environment, target: GLenum) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.GenerateMipmapOES(target) })
+    let fix_filter = min_filter_fix_active(env);
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        gles.GenerateMipmapOES(target);
+        if fix_filter {
+            note_mipmaps_for_min_filter(gles, shadow, target);
+        }
+    })
 }
 
 fn glGenFramebuffers(env: &mut Environment, n: GLsizei, framebuffers: MutPtr<GLuint>) {

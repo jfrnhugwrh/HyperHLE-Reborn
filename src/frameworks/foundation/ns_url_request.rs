@@ -5,7 +5,7 @@
  */
 //! `NSURLRequest and NSMutableURLRequest`.
 
-use super::{ns_string, NSTimeInterval, NSUInteger};
+use super::{ns_string, NSInteger, NSTimeInterval, NSUInteger};
 use crate::frameworks::foundation::ns_string::to_rust_string;
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
@@ -135,6 +135,163 @@ pub const CLASSES: ClassExports = objc_classes! {
         host.timeout_interval = timeout_interval;
     }
     this
+}
+
+// MARK: - NSCoding
+//
+// Keyed coding only (NSKeyedArchiver is the only archiver touchHLE has).
+// The URLs are archived as their absolute strings and rebuilt with
+// +URLWithString:, which keeps the archive independent of how NSURL itself is
+// archived. The body stream is deliberately not archived: a stream cannot be
+// serialized, and Apple's NSURLRequest does not archive it either.
+// Ownership: everything decoded is copied/retained here, because the
+// unarchiver only hands out autoreleased objects.
+
+- (id)initWithCoder:(id)coder {
+    let k_url = ns_string::get_static_str(env, "NS.url");
+    let url_string: id = msg![env; coder decodeObjectForKey:k_url];
+    let url: id = if url_string != nil {
+        msg_class![env; NSURL URLWithString:url_string]
+    } else {
+        nil
+    };
+    if url == nil {
+        // A request without a URL is not a valid object (see initWithURL:).
+        release(env, this);
+        return nil;
+    }
+    let url_copy: id = msg![env; url copy];
+    env.objc.borrow_mut::<NSURLRequestHostObject>(this).url = url_copy;
+
+    let k = ns_string::get_static_str(env, "NS.mainDocumentURL");
+    let main_string: id = msg![env; coder decodeObjectForKey:k];
+    if main_string != nil {
+        let main_url: id = msg_class![env; NSURL URLWithString:main_string];
+        if main_url != nil {
+            let main_copy: id = msg![env; main_url copy];
+            env.objc.borrow_mut::<NSURLRequestHostObject>(this).main_document_url = main_copy;
+        }
+    }
+
+    // Scalars: keep the defaults chosen by +allocWithZone: when a key is
+    // absent (e.g. an archive written by something else).
+    let k = ns_string::get_static_str(env, "NS.cachePolicy");
+    if msg![env; coder containsValueForKey:k] {
+        let v: NSInteger = msg![env; coder decodeIntegerForKey:k];
+        env.objc.borrow_mut::<NSURLRequestHostObject>(this).cache_policy = v as NSUInteger;
+    }
+    let k = ns_string::get_static_str(env, "NS.timeout");
+    if msg![env; coder containsValueForKey:k] {
+        let v: NSTimeInterval = msg![env; coder decodeDoubleForKey:k];
+        env.objc.borrow_mut::<NSURLRequestHostObject>(this).timeout_interval = v;
+    }
+    let k = ns_string::get_static_str(env, "NS.networkServiceType");
+    if msg![env; coder containsValueForKey:k] {
+        let v: NSInteger = msg![env; coder decodeIntegerForKey:k];
+        env.objc.borrow_mut::<NSURLRequestHostObject>(this).network_service_type = v as NSUInteger;
+    }
+    let k = ns_string::get_static_str(env, "NS.allowsCellularAccess");
+    if msg![env; coder containsValueForKey:k] {
+        let v: bool = msg![env; coder decodeBoolForKey:k];
+        env.objc.borrow_mut::<NSURLRequestHostObject>(this).allows_cellular_access = v;
+    }
+    let k = ns_string::get_static_str(env, "NS.HTTPShouldHandleCookies");
+    if msg![env; coder containsValueForKey:k] {
+        let v: bool = msg![env; coder decodeBoolForKey:k];
+        env.objc.borrow_mut::<NSURLRequestHostObject>(this).http_should_handle_cookies = v;
+    }
+    let k = ns_string::get_static_str(env, "NS.HTTPShouldUsePipelining");
+    if msg![env; coder containsValueForKey:k] {
+        let v: bool = msg![env; coder decodeBoolForKey:k];
+        env.objc.borrow_mut::<NSURLRequestHostObject>(this).http_should_use_pipelining = v;
+    }
+
+    // Objects: take an owned copy, and release whatever allocWithZone: gave
+    // us in its place.
+    let k = ns_string::get_static_str(env, "NS.HTTPMethod");
+    let method: id = msg![env; coder decodeObjectForKey:k];
+    if method != nil {
+        let method_copy: id = msg![env; method copy];
+        let host = env.objc.borrow_mut::<NSURLRequestHostObject>(this);
+        // The default "GET" is a static string we must not release.
+        let old = std::mem::replace(&mut host.http_method, method_copy);
+        let old_owned = std::mem::replace(&mut host.http_method_is_owned, true);
+        if old_owned {
+            release(env, old);
+        }
+    }
+    let k = ns_string::get_static_str(env, "NS.HTTPBody");
+    let body: id = msg![env; coder decodeObjectForKey:k];
+    if body != nil {
+        let body_copy: id = msg![env; body copy];
+        let old = std::mem::replace(
+            &mut env.objc.borrow_mut::<NSURLRequestHostObject>(this).http_body,
+            body_copy,
+        );
+        release(env, old);
+    }
+    let k = ns_string::get_static_str(env, "NS.HTTPHeaderFields");
+    let headers: id = msg![env; coder decodeObjectForKey:k];
+    if headers != nil {
+        // Always a mutable copy: the host object mutates this dictionary.
+        let headers_copy: id = msg![env; headers mutableCopy];
+        let old = std::mem::replace(
+            &mut env.objc.borrow_mut::<NSURLRequestHostObject>(this).http_header_fields,
+            headers_copy,
+        );
+        release(env, old);
+    }
+    this
+}
+
+- (())encodeWithCoder:(id)coder {
+    let host = env.objc.borrow::<NSURLRequestHostObject>(this);
+    let url = host.url;
+    let main_url = host.main_document_url;
+    let cache_policy = host.cache_policy;
+    let timeout = host.timeout_interval;
+    let service_type = host.network_service_type;
+    let cellular = host.allows_cellular_access;
+    let cookies = host.http_should_handle_cookies;
+    let pipelining = host.http_should_use_pipelining;
+    let method = host.http_method;
+    let body = host.http_body;
+    let headers = host.http_header_fields;
+
+    if url != nil {
+        let s: id = url_archive_string(env, url);
+        let k = ns_string::get_static_str(env, "NS.url");
+        () = msg![env; coder encodeObject:s forKey:k];
+    }
+    if main_url != nil {
+        let s: id = url_archive_string(env, main_url);
+        let k = ns_string::get_static_str(env, "NS.mainDocumentURL");
+        () = msg![env; coder encodeObject:s forKey:k];
+    }
+    let k = ns_string::get_static_str(env, "NS.cachePolicy");
+    () = msg![env; coder encodeInteger:(cache_policy as NSInteger) forKey:k];
+    let k = ns_string::get_static_str(env, "NS.timeout");
+    () = msg![env; coder encodeDouble:timeout forKey:k];
+    let k = ns_string::get_static_str(env, "NS.networkServiceType");
+    () = msg![env; coder encodeInteger:(service_type as NSInteger) forKey:k];
+    let k = ns_string::get_static_str(env, "NS.allowsCellularAccess");
+    () = msg![env; coder encodeBool:cellular forKey:k];
+    let k = ns_string::get_static_str(env, "NS.HTTPShouldHandleCookies");
+    () = msg![env; coder encodeBool:cookies forKey:k];
+    let k = ns_string::get_static_str(env, "NS.HTTPShouldUsePipelining");
+    () = msg![env; coder encodeBool:pipelining forKey:k];
+    if method != nil {
+        let k = ns_string::get_static_str(env, "NS.HTTPMethod");
+        () = msg![env; coder encodeObject:method forKey:k];
+    }
+    if body != nil {
+        let k = ns_string::get_static_str(env, "NS.HTTPBody");
+        () = msg![env; coder encodeObject:body forKey:k];
+    }
+    if headers != nil {
+        let k = ns_string::get_static_str(env, "NS.HTTPHeaderFields");
+        () = msg![env; coder encodeObject:headers forKey:k];
+    }
 }
 
 // MARK: - Dealloc
@@ -489,3 +646,21 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 };
+
+/// The string a request archives for one of its URLs.
+///
+/// `-[NSURL absoluteString]` returns the bare path for file URLs (and
+/// `-initWithString:` only builds a file URL from a `file:` string), so a file
+/// URL is archived with an explicit `file://` prefix to come back as a file
+/// URL. Other URLs archive as their string. The result is autoreleased or
+/// borrowed from the URL; the caller must not release it.
+fn url_archive_string(env: &mut crate::Environment, url: id) -> id {
+    let s: id = msg![env; url absoluteString];
+    let is_file: bool = msg![env; url isFileURL];
+    if !is_file {
+        return s;
+    }
+    let path = to_rust_string(env, s).into_owned();
+    let full = ns_string::from_rust_string(env, format!("file://{path}"));
+    autorelease(env, full)
+}

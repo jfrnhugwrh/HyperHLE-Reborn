@@ -191,6 +191,9 @@ pub(super) struct GLShadowState {
     pub(super) vertex_array_state: VertexArrayState,
     /// Client array state of the other (software) vertex array objects.
     pub(super) software_vao_states: HashMap<GLuint, VertexArrayState>,
+    /// Guest-requested `GL_TEXTURE_MIN_FILTER` per texture, for
+    /// `--fix-texture-min-filter`. See [super::min_filter].
+    pub(super) min_filters: super::min_filter::MinFilterTracker,
 }
 impl Default for GLShadowState {
     fn default() -> Self {
@@ -211,6 +214,7 @@ impl Default for GLShadowState {
             client_active_texture: 0,
             vertex_array_state: VertexArrayState::default(),
             software_vao_states: HashMap::new(),
+            min_filters: Default::default(),
         }
     }
 }
@@ -371,6 +375,13 @@ pub(super) struct EAGLContextHostObject {
 }
 impl HostObject for EAGLContextHostObject {}
 
+impl EAGLContextHostObject {
+    /// Whether this is a native OpenGL ES 1.x context.
+    pub(super) fn is_es1(&self) -> bool {
+        self.api == kEAGLRenderingAPIOpenGLES1
+    }
+}
+
 static NEXT_PRESENT_TOKEN: AtomicUsize = AtomicUsize::new(1);
 
 /// Log the effective state of the `fix_texture_min_filter` option once,
@@ -388,12 +399,12 @@ fn log_fix_min_filter_status(enabled: bool) {
     }
     if enabled {
         log!(
-            "fix_texture_min_filter: ON (after every level-0 texture upload, \
-             GL_TEXTURE_MIN_FILTER will be forced to GL_LINEAR if the guest \
-             never set it). This avoids flat-black/white-textured geometry on \
-             strict drivers (Mali, Adreno) for iOS games that don't ship \
-             mipmaps. Disable with --no-fix-texture-min-filter if a game \
-             genuinely needs mipmap minification."
+            "fix_texture_min_filter: ON (native OpenGL ES 1.x contexts only: \
+             a texture with no mip levels is given a non-mipmap min filter on \
+             the host, GL_LINEAR if the guest never set one; the guest's own \
+             filter is kept and reported, and textures with mip levels are \
+             untouched). This avoids flat-black textured geometry on strict \
+             drivers (Mali, Adreno). Disable with --no-fix-texture-min-filter."
         );
     } else {
         log!(
@@ -995,6 +1006,10 @@ pub const CLASSES: ClassExports = objc_classes! {
         return false;
     }
 
+    // Count the guest's present call for the stall watchdog. A host swap is
+    // counted separately in Window::swap_window, so the two can be compared.
+    crate::stall_watchdog::note_guest_present();
+
     // The presented frame should be displayed ASAP, but the next one must be
     // delayed, so this needs to be checked before returning.
     let frame_due = limit_framerate(&mut env.objc.borrow_mut::<EAGLContextHostObject>(this).next_frame_due, &env.options, env.guest_clock.speed().multiplier());
@@ -1203,10 +1218,23 @@ pub const CLASSES: ClassExports = objc_classes! {
             static LOGGED: std::sync::Once = std::sync::Once::new();
             LOGGED.call_once(|| {
                 log!(
-                    "EAGL presenter: fullscreen layer {:?} will be presented via {} \
+                    "EAGL presenter: drawable {:?} (fullscreen layer found: {}, \
+                     selected by {}) will be presented via {} \
                      (present_mode={:?}, translator={}, native_es1={}, es2={}) \
                      [this log will only be shown once]",
                     drawable,
+                    if fullscreen_layer == nil {
+                        "no".to_string()
+                    } else {
+                        format!("{fullscreen_layer:?}")
+                    },
+                    if fullscreen_layer != nil {
+                        "fullscreen-layer detection"
+                    } else if use_ios_es2_direct_path {
+                        "--ios-es2-direct-present"
+                    } else {
+                        "--present-mode=direct (drawable is not a recognized fullscreen layer)"
+                    },
                     if use_readback {
                         "glReadPixels readback + compositor"
                     } else {
@@ -1221,7 +1249,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
         if use_readback {
             log_dbg!(
-                "Layer {:?} is the fullscreen layer, presenting renderbuffer {:?} through RAM readback.",
+                "Drawable {:?} is being presented via RAM readback, renderbuffer {:?}.",
                 drawable,
                 renderbuffer,
             );
@@ -1230,7 +1258,7 @@ pub const CLASSES: ClassExports = objc_classes! {
             }
         } else {
             log_dbg!(
-                "Layer {:?} is the fullscreen layer, presenting renderbuffer {:?} directly (fast path).",
+                "Drawable {:?} is being presented directly (GPU copy), renderbuffer {:?}.",
                 drawable,
                 renderbuffer,
             );
@@ -1356,6 +1384,17 @@ pub const CLASSES: ClassExports = objc_classes! {
             return false;
         };
         dump_readback_ppm(&pixels_vec, width, height);
+        // Visible-content sample for the stall watchdog. Cheap enough to do
+        // every 30th frame; the pixels are already in RAM on this path.
+        {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static SAMPLE_N: AtomicU32 = AtomicU32::new(0);
+            if SAMPLE_N.fetch_add(1, Ordering::Relaxed) % 30 == 0 {
+                crate::stall_watchdog::note_visible_pixels(
+                    pixels_vec.iter().copied().max().unwrap_or(0),
+                );
+            }
+        }
         // DIAG (TOUCHHLE_TRACE_PRESENT=1): is the frame we read back actually
         // non-black? This tells apart "renderer produced a black frame"
         // (content/loading) from "we present fine but the pixels never reach
